@@ -11,6 +11,65 @@ let liveFileTimer = null;
 let transferNotified = false;
 let downloading = false;
 
+// --- Ephemeral chat --------------------------------------------------------
+// Same deal as the sender side: messages ride the data channel, live only
+// in this page's memory, and disappear when the tab closes.
+const MAX_CHAT_LOG = 200;
+
+function fmtChatTime(at) {
+  try {
+    return new Date(at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  } catch { return ''; }
+}
+
+function appendChat(from, text, mine) {
+  const log = $('chatLog');
+  const div = document.createElement('div');
+  div.className = mine ? 'chat-msg mine' : 'chat-msg';
+  const who = document.createElement('span');
+  who.className = 'chat-from';
+  who.textContent = from;
+  const body = document.createElement('span');
+  body.textContent = ` ${text}`;
+  const time = document.createElement('span');
+  time.className = 'chat-time';
+  time.textContent = fmtChatTime(Date.now());
+  div.append(who, body, time);
+  log.appendChild(div);
+  while (log.children.length > MAX_CHAT_LOG) log.firstChild.remove();
+  log.scrollTop = log.scrollHeight;
+}
+
+function appendChatSystem(text) {
+  const log = $('chatLog');
+  const div = document.createElement('div');
+  div.className = 'chat-msg system';
+  div.textContent = text;
+  log.appendChild(div);
+  while (log.children.length > MAX_CHAT_LOG) log.firstChild.remove();
+  log.scrollTop = log.scrollHeight;
+}
+
+function setChatEnabled(enabled) {
+  $('chatInput').disabled = !enabled;
+  $('chatSendBtn').disabled = !enabled;
+  $('chatInput').placeholder = enabled ? 'Message the sender…' : 'Connecting…';
+}
+
+$('chatForm').addEventListener('submit', e => {
+  e.preventDefault();
+  const input = $('chatInput');
+  const text = input.value.trim();
+  if (!text || !liveReceiver) return;
+  if (liveReceiver.sendChat(text)) {
+    appendChat('You', text, true);
+    input.value = '';
+  } else {
+    appendChatSystem('Not connected yet — message not sent.');
+  }
+  input.focus();
+});
+
 function fmtSize(n) {
   if (n < 1024) return `${n} B`;
   for (const unit of ['KB', 'MB', 'GB']) {
@@ -56,6 +115,10 @@ async function connectShare() {
   $('errCard').hidden = true;
   $('pwCard').hidden = true;
   $('shareCard').hidden = true;
+  $('chatBox').hidden = true;
+  $('chatLog').innerHTML = '';
+  $('chatInput').value = '';
+  setChatEnabled(false);
   setLiveStatus('Connecting to the sender…');
 
   try {
@@ -80,6 +143,8 @@ async function connectShare() {
         setLiveStatus('Connected directly to the sender.');
         if (listing.hasText) liveReceiver.requestText();
       },
+      onConnect: () => setChatEnabled(true),
+      onChat: msg => appendChat('Sender', msg.text, false),
       onText: text => {
         noteText = text;
         if (notePromiseResolve) notePromiseResolve(text);
@@ -205,6 +270,7 @@ function renderListing(data) {
       : (data.hasText ? '↓ Download note' : '↓ Download');
   }
   $('shareCard').hidden = false;
+  $('chatBox').hidden = false;
 }
 
 function armLiveFileTimer() {

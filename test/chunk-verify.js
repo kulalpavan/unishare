@@ -130,11 +130,13 @@ const { startSender, startReceiver } = sandbox.UniShareLive;
   assert.ok(manifestJson.length > 262144, 'manifest must exceed the 256KB data-channel limit');
   assert.ok(bigText.length > 262144, 'note must exceed the 256KB data-channel limit');
 
-  await startSender({
+  const senderChats = [];
+  const senderHandle = await startSender({
     id: 'big-room-test', files: [], text: bigText, listing,
     passwordHash: null, expiresAt: null,
     onStatus: () => {}, onReceiverJoin: () => {}, onReceiverLeft: () => {},
-    onProgress: () => {}, onFileSent: () => {}, onTransferComplete: () => {}
+    onProgress: () => {}, onFileSent: () => {}, onTransferComplete: () => {},
+    onChat: msg => senderChats.push(msg), onConnect: () => {}
   });
 
   let gotManifest = null;
@@ -142,6 +144,7 @@ const { startSender, startReceiver } = sandbox.UniShareLive;
   let fileError = null;
   let sessionErrors = 0;
   let receiverHandle = null;
+  const receiverChats = [];
   const done = new Promise(resolve => {
     startReceiver({
       id: 'big-room-test', passwordHash: null, timeoutMs: 5000,
@@ -150,7 +153,8 @@ const { startSender, startReceiver } = sandbox.UniShareLive;
       onText: text => { gotText = text; resolve(); },
       onFileStart: () => {}, onFileProgress: () => {}, onFileComplete: () => {},
       onFileError: (path, message) => { fileError = { path, message }; },
-      onDone: () => {}, onError: () => { sessionErrors++; }
+      onDone: () => {}, onError: () => { sessionErrors++; },
+      onChat: msg => receiverChats.push(msg), onConnect: () => {}
     }).then(receiver => {
       receiverHandle = receiver;
       // The receiver asks for the text once the manifest arrives; emulate
@@ -190,6 +194,31 @@ const { startSender, startReceiver } = sandbox.UniShareLive;
   await new Promise(r => setTimeout(r, 100));
   assert.equal(gotText, bigText, 'session still serves requests after a file error');
   console.log('ok - per-file failure is isolated, session survives');
+
+  // Ephemeral chat over the same data channel: receiver -> sender (labeled
+  // per peer) and sender -> receiver, with nothing stored anywhere.
+  assert.equal(receiverHandle.sendChat('hey sender, got the listing'), true, 'chat sends while connected');
+  await new Promise(r => setTimeout(r, 50));
+  assert.equal(senderChats.length, 1, 'sender received the chat');
+  assert.equal(senderChats[0].text, 'hey sender, got the listing');
+  assert.equal(senderChats[0].from, 'Receiver 1', 'sender sees the per-peer label');
+  assert.equal(senderHandle.sendChat('hey receiver, sending soon'), 1, 'sender broadcast reaches the receiver');
+  await new Promise(r => setTimeout(r, 50));
+  assert.equal(receiverChats.length, 1, 'receiver received the chat');
+  assert.equal(receiverChats[0].text, 'hey receiver, sending soon');
+  assert.equal(receiverChats[0].from, 'sender');
+  // Long messages are truncated at send time, never delivered whole.
+  receiverHandle.sendChat('x'.repeat(5000));
+  await new Promise(r => setTimeout(r, 50));
+  assert.equal(senderChats[1].text.length, 2000, 'oversized chat truncated to the cap');
+  // Raw oversized messages from a modified peer are dropped, not rendered.
+  senderDc.send(JSON.stringify({ t: 'chat', from: 'sender', text: 'y'.repeat(5000), at: 1 }));
+  receiverDc.send(JSON.stringify({ t: 'chat', from: 'receiver', text: 'z'.repeat(5000), at: 1 }));
+  await new Promise(r => setTimeout(r, 50));
+  assert.equal(receiverChats.length, 1, 'oversized inbound chat dropped on the receiver');
+  assert.equal(senderChats.length, 2, 'oversized inbound chat dropped on the sender');
+  assert.equal(sessionErrors, 0, 'chat traffic never fails the session');
+  console.log('ok - ephemeral chat round-trips, truncates, and drops oversized messages');
   console.log('chunk-verify: all checks passed');
   process.exit(0);
 })().catch(err => { console.error('chunk-verify FAILED:', err); process.exit(1); });

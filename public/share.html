@@ -69,6 +69,16 @@
 
         <a class="btn lime big dl" id="downloadAll" href="#">↓ Download all</a>
         <p class="meta" id="liveStatus" hidden></p>
+
+        <div class="chat" id="chatBox" hidden>
+          <h3>CHAT.EXE — MESSAGES ARE NEVER STORED</h3>
+          <div class="chat-log" id="chatLog" aria-live="polite"></div>
+          <form class="chat-form" id="chatForm">
+            <input type="text" id="chatInput" maxlength="2000" placeholder="Connecting…" autocomplete="off" disabled>
+            <button class="btn cyan" type="submit" id="chatSendBtn" disabled>Send</button>
+          </form>
+          <p class="meta">Messages travel directly between browsers and vanish when this tab closes.</p>
+        </div>
       </div>
     </section>
 

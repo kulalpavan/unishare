@@ -125,6 +125,61 @@ uploadBtn.addEventListener('click', doUpload);
 
 const EXPIRY_UNITS = { minutes: 60e3, hours: 3600e3, days: 86400e3 };
 
+// --- Ephemeral chat --------------------------------------------------------
+// Messages ride the same data channel as the files: straight from this
+// tab to the receiver's browser, kept only in page memory, never stored
+// anywhere. Closing the tab erases them.
+const MAX_CHAT_LOG = 200;
+
+function fmtChatTime(at) {
+  try {
+    return new Date(at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  } catch { return ''; }
+}
+
+function appendChat(from, text, mine) {
+  const log = $('chatLog');
+  const div = document.createElement('div');
+  div.className = mine ? 'chat-msg mine' : 'chat-msg';
+  const who = document.createElement('span');
+  who.className = 'chat-from';
+  who.textContent = from;
+  const body = document.createElement('span');
+  body.textContent = ` ${text}`;
+  const time = document.createElement('span');
+  time.className = 'chat-time';
+  time.textContent = fmtChatTime(Date.now());
+  div.append(who, body, time);
+  log.appendChild(div);
+  while (log.children.length > MAX_CHAT_LOG) log.firstChild.remove();
+  log.scrollTop = log.scrollHeight;
+}
+
+function appendChatSystem(text) {
+  const log = $('chatLog');
+  const div = document.createElement('div');
+  div.className = 'chat-msg system';
+  div.textContent = text;
+  log.appendChild(div);
+  while (log.children.length > MAX_CHAT_LOG) log.firstChild.remove();
+  log.scrollTop = log.scrollHeight;
+}
+
+$('chatForm').addEventListener('submit', e => {
+  e.preventDefault();
+  const input = $('chatInput');
+  const text = input.value.trim();
+  if (!text || !liveSender) return;
+  const delivered = liveSender.sendChat(text);
+  if (delivered > 0) {
+    appendChat('You', text, true);
+    input.value = '';
+  } else {
+    appendChatSystem('No receiver connected yet — message not sent.');
+  }
+  input.focus();
+});
+
 // --- Live P2P share --------------------------------------------------------
 // No upload: files and text stay in this tab. Creating a link registers this
 // tab as the live sender; the receiver downloads straight from here.
@@ -175,6 +230,7 @@ $('stopShareBtn').addEventListener('click', () => {
   liveSender = null;
   liveDone = false;
   $('stopShareBtn').hidden = true;
+  $('chatBox').hidden = true;
   setLiveStatus('Share ended. This link no longer works.', 'err');
   updateTabWarning();
 });
@@ -287,7 +343,8 @@ async function doUpload() {
         renderLiveFiles();
         setLiveStatus('✓ A receiver downloaded everything. Keep this tab open until every receiver is done.', 'ok');
         updateTabWarning();
-      }
+      },
+      onChat: msg => appendChat(msg.from, msg.text, false)
     });
 
     const url = new URL(`/s/${id}`, location.href).href;
@@ -301,6 +358,9 @@ async function doUpload() {
     ].join(' · ');
     $('result').hidden = false;
     $('stopShareBtn').hidden = false;
+    $('chatLog').innerHTML = '';
+    $('chatInput').value = '';
+    $('chatBox').hidden = false;
     $('result').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
     statusEl.textContent = '';
     setLiveStatus('Live: waiting for the receiver. Keep this tab open.');

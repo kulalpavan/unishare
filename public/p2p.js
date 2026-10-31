@@ -11,6 +11,10 @@
  *   sender -> receiver: { t: 'manifest', ... } | { t: 'text', text }
  *                       | { t: 'file-start', path, size } + binary chunks + { t: 'file-end', path }
  *                       | { t: 'error', message }
+ *   either way: { t: 'chat', from, text, at } — ephemeral chat. Messages
+ *   travel only over the data channel, are kept only in page memory, and
+ *   are never written to disk or sent to the server. Closing the tab
+ *   erases them.
  *
  * Passwords are verified by comparing SHA-256 hashes: the sender registers
  * the hash, the receiver sends the hash of what was typed, and the server
@@ -30,6 +34,11 @@
   // could otherwise OOM the receiver's tab). 200 parts * 60KB = 12MB,
   // far above any legitimate manifest (bounded by the 4MB signaling cap).
   const MAX_JSON_PARTS = 200;
+  // Chat limits: messages are truncated when sent, and anything arriving
+  // over the cap is dropped, so a misbehaving peer can't flood a tab's
+  // memory with chat text.
+  const MAX_CHAT_CHARS = 2000;
+  const MAX_CHAT_RECEIVE = 4000;
   // Fallback ICE servers if the hub returns none: STUN plus the Open Relay
   // Project's free shared TURN servers (same default as the server).
   const DEFAULT_ICE_SERVERS = [
@@ -146,7 +155,7 @@
     return pc;
   }
 
-  function attachSenderChannel(dc, filesByPath, text, listing, onProgress, onFileSent) {
+  function attachSenderChannel(dc, filesByPath, text, listing, onProgress, onFileSent, onChat, peerLabel) {
     dc.binaryType = 'arraybuffer';
     dc.onmessage = async event => {
       let msg;
@@ -157,6 +166,14 @@
       }
       if (!msg || typeof msg.t !== 'string') return;
       try {
+        if (msg.t === 'chat') {
+          // Ephemeral chat from one receiver: delivered only to this tab's
+          // UI, never stored, never relayed to other receivers.
+          if (typeof msg.text === 'string' && msg.text.length <= MAX_CHAT_RECEIVE && onChat) {
+            try { onChat({ from: peerLabel || 'Receiver', text: msg.text, at: msg.at || Date.now() }); } catch {}
+          }
+          return;
+        }
         if (msg.t === 'get-file') {
           const entry = filesByPath.get(msg.path);
           if (!entry) {
@@ -187,10 +204,11 @@
   async function startSender(opts) {
     const {
       id, files, text, listing, passwordHash, expiresAt,
-      onStatus, onReceiverJoin, onReceiverLeft, onProgress, onFileSent, onTransferComplete
+      onStatus, onReceiverJoin, onReceiverLeft, onProgress, onFileSent, onTransferComplete,
+      onChat, onConnect
     } = opts;
     const filesByPath = new Map(files.map(f => [f.path, f]));
-    const peers = new Map(); // receiverId -> { pc, dc }
+    const peers = new Map(); // receiverId -> { pc, dc, label }
     const pendingSignals = new Map(); // receiverId -> [data] received before the peer existed
     let socket = null;
     let iceServers = DEFAULT_ICE_SERVERS.slice();
@@ -199,6 +217,7 @@
     let expired = false;
     let reconnectTimer = null;
     let reconnectAttempts = 0;
+    let receiverCount = 0;
     const MAX_RECONNECT_ATTEMPTS = 30;
 
     const setStatus = msg => { if (onStatus) onStatus(msg); };
@@ -258,9 +277,19 @@
       }
       if (msg.type === 'receiver-joined') {
         const receiverId = msg.receiverId;
+        const label = `Receiver ${++receiverCount}`;
         const pc = makePeerConnection(iceServers, data => {
           sendSocket({ type: 'signal', to: receiverId, data });
-        }, dc => attachSenderChannel(dc, filesByPath, text, listing, onProgress, onFileSent));
+        }, dc => {
+          const peer = peers.get(receiverId);
+          if (peer) peer.dc = dc;
+          dc.onopen = () => { if (onConnect) { try { onConnect(receiverId, label); } catch {} } };
+          dc.onclose = () => {
+            const p = peers.get(receiverId);
+            if (p && p.dc === dc) p.dc = null;
+          };
+          attachSenderChannel(dc, filesByPath, text, listing, onProgress, onFileSent, onChat, label);
+        });
         pc.onconnectionstatechange = () => {
           if (pc.connectionState === 'failed') {
             try { pc.close(); } catch {}
@@ -268,7 +297,7 @@
             pendingSignals.delete(receiverId);
           }
         };
-        peers.set(receiverId, { pc, dc: null });
+        peers.set(receiverId, { pc, dc: null, label });
         // Replay any signals that arrived before this peer existed.
         const queued = pendingSignals.get(receiverId);
         if (queued) {
@@ -324,6 +353,20 @@
     });
 
     return {
+      // Broadcast a chat message to every connected receiver. Returns how
+      // many receivers it reached (0 when nobody is connected yet).
+      // Messages are truncated, never stored, and never touch the server.
+      sendChat(rawText) {
+        const message = String(rawText == null ? '' : rawText).slice(0, MAX_CHAT_CHARS).trim();
+        if (!message) return 0;
+        let delivered = 0;
+        for (const peer of peers.values()) {
+          if (peer.dc && peer.dc.readyState === 'open') {
+            try { sendJson(peer.dc, { t: 'chat', from: 'sender', text: message, at: Date.now() }); delivered++; } catch {}
+          }
+        }
+        return delivered;
+      },
       close() {
         closed = true;
         clearTimeout(reconnectTimer);
@@ -338,7 +381,7 @@
   async function startReceiver(opts) {
     const {
       id, passwordHash, timeoutMs, onStatus, onJoin, onManifest, onText, onFileStart,
-      onFileProgress, onFileComplete, onFileError, onDone, onError
+      onFileProgress, onFileComplete, onFileError, onDone, onError, onChat, onConnect
     } = opts;
 
     let socket = null;
@@ -462,6 +505,7 @@
         dc.onopen = () => {
           clearTimeout(connectWatchdog);
           if (onStatus) onStatus('Connected directly to the sender.');
+          if (onConnect) { try { onConnect(); } catch {} }
           dc.send(JSON.stringify({ t: 'get-manifest' }));
           flushRequests();
         };
@@ -516,6 +560,13 @@
         }
         if (msg.t === 'manifest' && onManifest) onManifest(msg);
         if (msg.t === 'text' && onText) onText(msg.text);
+        if (msg.t === 'chat') {
+          // Ephemeral chat from the sender: UI-only, never stored.
+          if (typeof msg.text === 'string' && msg.text.length <= MAX_CHAT_RECEIVE && onChat) {
+            try { onChat({ from: 'sender', text: msg.text, at: msg.at || Date.now() }); } catch {}
+          }
+          return;
+        }
         if (msg.t === 'error') fail(new Error(msg.message || 'transfer-error'));
         if (msg.t === 'file-error') {
           // Only this file failed; the session stays alive for the rest.
@@ -553,6 +604,15 @@
     return {
       requestText() { queueRequest({ t: 'get-text' }); },
       requestFile(path) { queueRequest({ t: 'get-file', path }); },
+      // Send a chat message straight to the sender over the data channel.
+      // Returns false when the direct connection isn't open yet — chat is
+      // never queued or stored, so an unsent message is simply not sent.
+      sendChat(rawText) {
+        const message = String(rawText == null ? '' : rawText).slice(0, MAX_CHAT_CHARS).trim();
+        if (!message || !dcOpen()) return false;
+        try { dc.send(JSON.stringify({ t: 'chat', from: 'receiver', text: message, at: Date.now() })); return true; }
+        catch { return false; }
+      },
       notifyDownloaded() {
         sendSocket({ type: 'transfer-complete' });
       },
