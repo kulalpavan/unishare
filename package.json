@@ -7,6 +7,7 @@
     "start": "node --env-file-if-exists=.env server.js",
     "dev": "node --env-file-if-exists=.env --watch server.js",
     "verify": "node --env-file-if-exists=.env test/verify.js",
+    "verify:live": "node test/live-verify.js",
     "verify:r2": "node test/r2-smoke.js",
     "db:up": "docker compose up -d",
     "db:down": "docker compose down"
@@ -22,7 +23,8 @@
     "express": "^4.21.0",
     "express-rate-limit": "^8.7.2",
     "multer": "^2.5.0",
-    "pg": "^8.23.1"
+    "pg": "^8.23.1",
+    "ws": "^8.20.0"
   },
   "overrides": {
     "minimatch": "^11.0.1"

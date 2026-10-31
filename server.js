@@ -9,6 +9,7 @@ const express = require('express');
 const multer = require('multer');
 const bcrypt = require('bcryptjs');
 const rateLimit = require('express-rate-limit');
+const { WebSocketServer } = require('ws');
 
 const db = require('./db');
 const storage = require('./storage');
@@ -153,8 +154,23 @@ function cleanupTemp(files) {
 
 app.get('/api/health', wrap(async (req, res) => {
   await db.pool.query('SELECT 1');
-  res.json({ ok: true, storage: storage.driver });
+  res.json({ ok: true, storage: storage.driver, liveRooms: liveRooms.size });
 }));
+
+// ICE servers for WebRTC peer connections. Configure via ICE_SERVERS env var
+// (JSON array). Defaults to Google's free public STUN server; add a free TURN
+// entry (e.g. Open Relay Project) for symmetric-NAT fallback.
+function iceServers() {
+  try {
+    const parsed = process.env.ICE_SERVERS ? JSON.parse(process.env.ICE_SERVERS) : null;
+    if (Array.isArray(parsed) && parsed.length) return parsed;
+  } catch {}
+  return [{ urls: 'stun:stun.l.google.com:19302' }];
+}
+
+app.get('/api/ice', (req, res) => {
+  res.json({ iceServers: iceServers() });
+});
 
 async function shareListing(share) {
   return storage.list(share.id);
@@ -443,6 +459,170 @@ function cleanTempDir() {
 
 const server = http.createServer(app);
 
+// ---------------------------------------------------------------------------
+// Live P2P signaling hub (hybrid mode).
+//
+// The stored share in PostgreSQL remains the fallback: a receiver first
+// tries to reach the sender live over WebRTC, and falls back to the stored
+// HTTP download when the sender is offline. This hub only relays WebRTC
+// handshake signals between browsers; no file bytes ever pass through it.
+// Rooms are ephemeral in-memory mappings, wiped when connections drop.
+// ---------------------------------------------------------------------------
+
+const liveRooms = new Map(); // shareId -> { sender, receivers: Map, createdAt, listing }
+const MAX_SIGNAL_BYTES = 256 * 1024;
+const ROOM_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
+const wss = new WebSocketServer({ server, path: '/live', maxPayload: MAX_SIGNAL_BYTES });
+
+function liveSend(ws, obj) {
+  if (ws.readyState === ws.OPEN) {
+    try { ws.send(JSON.stringify(obj)); } catch {}
+  }
+}
+
+function getOrCreateRoom(id) {
+  let room = liveRooms.get(id);
+  if (!room) {
+    room = { sender: null, receivers: new Map(), createdAt: Date.now(), listing: null };
+    liveRooms.set(id, room);
+  }
+  return room;
+}
+
+function pruneRoom(id) {
+  const room = liveRooms.get(id);
+  if (!room) return;
+  const senderGone = !room.sender || room.sender.ws.readyState !== room.sender.ws.OPEN;
+  if (senderGone && room.receivers.size === 0) liveRooms.delete(id);
+}
+
+wss.on('connection', ws => {
+  ws._id = crypto.randomBytes(8).toString('hex');
+  ws._role = null;
+  ws._roomId = null;
+  ws._alive = true;
+  ws.on('pong', () => { ws._alive = true; });
+
+  ws.on('message', async raw => {
+    let msg;
+    try {
+      msg = JSON.parse(raw.toString('utf8'));
+    } catch {
+      return liveSend(ws, { type: 'error', code: 'bad-message' });
+    }
+    if (!msg || typeof msg.type !== 'string') {
+      return liveSend(ws, { type: 'error', code: 'bad-message' });
+    }
+
+    try {
+      if (msg.type === 'register-sender') {
+        if (typeof msg.id !== 'string' || !/^[A-Za-z0-9_-]{8,64}$/.test(msg.id)) {
+          return liveSend(ws, { type: 'error', code: 'bad-id' });
+        }
+        const room = getOrCreateRoom(msg.id);
+        if (room.sender && room.sender.ws.readyState === room.sender.ws.OPEN) {
+          try { room.sender.ws.close(); } catch {}
+        }
+        room.sender = { ws, id: ws._id };
+        room.listing = msg.listing && typeof msg.listing === 'object' ? msg.listing : null;
+        room.createdAt = Date.now();
+        ws._role = 'sender';
+        ws._roomId = msg.id;
+        return liveSend(ws, { type: 'registered', iceServers: iceServers() });
+      }
+
+      if (msg.type === 'join') {
+        if (typeof msg.id !== 'string' || !/^[A-Za-z0-9_-]{8,64}$/.test(msg.id)) {
+          return liveSend(ws, { type: 'error', code: 'bad-id' });
+        }
+        let share;
+        try {
+          share = await db.getShare(msg.id);
+        } catch (err) {
+          console.error('[live] share lookup failed:', err.message);
+          return liveSend(ws, { type: 'error', code: 'server-error' });
+        }
+        if (!share) return liveSend(ws, { type: 'error', code: 'share-not-found' });
+        if (statusFor(share) === 'expired') return liveSend(ws, { type: 'error', code: 'share-expired' });
+        if (share.password_hash) {
+          const pw = typeof msg.password === 'string' ? msg.password : '';
+          if (!pw || !(await bcrypt.compare(pw, share.password_hash))) {
+            return liveSend(ws, { type: 'error', code: 'wrong-password' });
+          }
+        }
+        const room = getOrCreateRoom(msg.id);
+        room.receivers.set(ws._id, ws);
+        ws._role = 'receiver';
+        ws._roomId = msg.id;
+        const senderOnline = !!(room.sender && room.sender.ws.readyState === room.sender.ws.OPEN);
+        liveSend(ws, {
+          type: 'joined',
+          senderOnline,
+          listing: room.listing,
+          iceServers: iceServers()
+        });
+        if (senderOnline) liveSend(room.sender.ws, { type: 'receiver-joined', receiverId: ws._id });
+        return;
+      }
+
+      if (msg.type === 'signal') {
+        const room = ws._roomId ? liveRooms.get(ws._roomId) : null;
+        if (!room || !msg.data || typeof msg.data !== 'object') return;
+        if (ws._role === 'receiver' && room.sender) {
+          liveSend(room.sender.ws, { type: 'signal', from: ws._id, data: msg.data });
+        } else if (ws._role === 'sender' && typeof msg.to === 'string') {
+          const target = room.receivers.get(msg.to);
+          if (target) liveSend(target, { type: 'signal', from: ws._id, data: msg.data });
+        }
+        return;
+      }
+    } catch (err) {
+      console.error('[live] message handler failed:', err.message);
+      liveSend(ws, { type: 'error', code: 'server-error' });
+    }
+  });
+
+  ws.on('close', () => {
+    const room = ws._roomId ? liveRooms.get(ws._roomId) : null;
+    if (!room) return;
+    if (ws._role === 'sender' && room.sender && room.sender.ws === ws) {
+      room.sender = null;
+      for (const receiver of room.receivers.values()) {
+        liveSend(receiver, { type: 'sender-offline' });
+      }
+    }
+    if (ws._role === 'receiver') {
+      room.receivers.delete(ws._id);
+      if (room.sender) liveSend(room.sender.ws, { type: 'receiver-left', receiverId: ws._id });
+    }
+    pruneRoom(ws._roomId);
+  });
+});
+
+setInterval(() => {
+  for (const [id, room] of liveRooms) {
+    const senderGone = !room.sender || room.sender.ws.readyState !== room.sender.ws.OPEN;
+    if (senderGone && room.receivers.size === 0) liveRooms.delete(id);
+  }
+  for (const ws of wss.clients) {
+    if (!ws._alive) { try { ws.terminate(); } catch {} continue; }
+    ws._alive = false;
+    try { ws.ping(); } catch {}
+  }
+}, 30 * 1000).unref();
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, room] of liveRooms) {
+    if (now - room.createdAt > ROOM_MAX_AGE_MS) {
+      if (room.sender) { try { room.sender.ws.close(); } catch {} }
+      for (const receiver of room.receivers.values()) { try { receiver.close(); } catch {} }
+      liveRooms.delete(id);
+    }
+  }
+}, 5 * 60 * 1000).unref();
+
 let cleaning = false;
 
 async function cleanupOrphans() {
@@ -486,4 +666,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { app, server, db, storage, cleanupExpired, start };
+module.exports = { app, server, db, storage, cleanupExpired, start, liveRooms, iceServers, wss };

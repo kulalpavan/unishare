@@ -152,6 +152,10 @@ async function doUpload() {
     statusEl.textContent = '';
 
     navigator.clipboard.writeText(url).catch(() => {});
+
+    // Hybrid mode: stay live so receivers can pull straight from this tab
+    // over WebRTC. The stored copy remains the fallback when this tab closes.
+    startLiveSender(data, text);
   } catch (err) {
     statusEl.textContent = err.message;
     statusEl.classList.add('err');
@@ -161,6 +165,46 @@ async function doUpload() {
 }
 
 $('copyBtn').addEventListener('click', () => copyLink($('shareLink').textContent));
+
+// --- Live P2P sender -------------------------------------------------------
+let liveSender = null;
+
+async function startLiveSender(share, text) {
+  const liveEl = $('liveStatus');
+  if (!window.UniShareLive || !window.RTCPeerConnection || !liveEl) return;
+  try { if (liveSender) liveSender.close(); } catch {}
+  liveEl.hidden = false;
+  liveEl.textContent = 'Connecting live sharing…';
+  const files = pickedFiles.map(f => ({ file: f, path: relPath(f) }));
+  const listing = {
+    kind: share.kind,
+    topName: share.kind === 'folder' ? share.folderName : null,
+    folderName: share.folderName || null,
+    files: files.map(f => ({ path: f.path, size: f.file.size })),
+    hasText: !!text.trim()
+  };
+  try {
+    liveSender = await window.UniShareLive.startSender({
+      id: share.id,
+      files,
+      text,
+      listing,
+      onStatus: msg => { liveEl.textContent = msg; },
+      onReceiverJoin: () => { liveEl.textContent = 'Live: a receiver connected. Sending directly from this tab…'; },
+      onProgress: (path, done, total) => {
+        liveEl.textContent = `Live: sending ${path} — ${Math.round((done / total) * 100)}%`;
+      }
+    });
+  } catch (err) {
+    // Live sharing is best-effort; the stored copy still works.
+    liveEl.textContent = 'Live sharing unavailable. The stored copy is still available from the link.';
+  }
+}
+
+window.addEventListener('pagehide', () => {
+  try { if (liveSender) liveSender.close(); } catch {}
+});
+
 function copyLink(v) {
   if (!v) {
     statusEl.textContent = 'Create a share link first.';

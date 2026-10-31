@@ -12,6 +12,35 @@ Share files, folders, and text notes with a single no-login link.
 - Optional expiry (minutes / hours / days)
 - Expired shares are rejected and periodically cleaned up
 - Rate limits on uploads and password attempts
+- **Live P2P transfers (hybrid mode):** while the sender's tab stays open,
+  receivers download straight from the sender's browser over WebRTC data
+  channels, with the server only relaying handshake signals over a
+  WebSocket hub (`/live`). When the sender is offline, the stored copy in
+  PostgreSQL/R2 is served exactly as before — no storage is removed.
+
+## Live P2P transfers
+
+How it works:
+
+1. Creating a share uploads the files as usual (the stored fallback) and
+   the sender's tab registers as a live sender for that share id.
+2. A receiver opening the link first tries the `/live` WebSocket hub. If
+   the sender is online, the page offers a direct P2P download; files
+   stream in 16 KB chunks over a WebRTC data channel and folders are
+   re-zipped in the browser (JSZip, loaded from CDN, with per-file
+   downloads as fallback).
+3. If the sender is offline (or live setup fails), the page silently uses
+   the stored HTTP download. Password checks for live joins run
+   server-side against the same bcrypt hash, so locked shares stay locked.
+
+Signaling rooms are ephemeral in-memory mappings, wiped when connections
+drop (max 24 h). No file bytes pass through the signaling hub.
+
+ICE servers are configured with the `ICE_SERVERS` env var (JSON array);
+the default is Google's free public STUN server. Behind symmetric NATs
+(common on mobile networks) direct connections fail without a TURN
+server — add a free TURN entry, e.g. from the Open Relay Project, to
+`ICE_SERVERS`. See `.env.example`.
 
 ## Local setup
 

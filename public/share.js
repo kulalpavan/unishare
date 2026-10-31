@@ -1,5 +1,9 @@
 const $ = id => document.getElementById(id);
 const shareId = location.pathname.split('/')[2];
+let lastPassword = '';
+let currentShareData = null;
+let liveReceiver = null;
+let liveFileResolver = null;
 
 function api(path, opts) {
   return fetch(path, opts).then(async res => ({ status: res.status, data: await res.json().catch(() => ({})) }));
@@ -96,12 +100,137 @@ async function loadShare() {
       : (data.text ? '↓ Download note' : '↓ Download');
   }
   $('shareCard').hidden = false;
+  currentShareData = data;
+  tryLive(data);
 }
+
+// --- Live P2P download (hybrid mode) ---------------------------------------
+// If the sender's tab is still open, files stream straight from their browser
+// over WebRTC. Otherwise the stored HTTP download above is the fallback.
+
+async function tryLive(data) {
+  const liveEl = $('liveStatus');
+  const liveBtn = $('liveDownload');
+  if (!liveEl || !liveBtn) return;
+  liveBtn.hidden = true;
+  const files = data.files || [];
+  if (!window.UniShareLive || !window.RTCPeerConnection || !files.length) return;
+  try { if (liveReceiver) liveReceiver.close(); } catch {}
+  liveReceiver = null;
+  liveEl.hidden = false;
+  liveEl.textContent = 'Checking for a live sender…';
+  try {
+    liveReceiver = await window.UniShareLive.startReceiver({
+      id: shareId,
+      password: lastPassword,
+      timeoutMs: 5000,
+      onStatus: msg => { liveEl.textContent = msg; },
+      onManifest: () => {
+        liveEl.textContent = 'Live sender online — files can stream straight from their browser.';
+        liveBtn.hidden = false;
+      },
+      onFileComplete: (path, size, blob) => {
+        if (liveFileResolver && liveFileResolver.path === path) {
+          const r = liveFileResolver;
+          liveFileResolver = null;
+          r.resolve(blob);
+        }
+      },
+      onError: err => {
+        liveBtn.hidden = true;
+        if (err && err.message === 'sender-offline') {
+          liveEl.textContent = 'Sender is offline — using the stored copy below.';
+        } else if (err && err.message === 'wrong-password') {
+          liveEl.hidden = true;
+        } else {
+          liveEl.textContent = 'Live transfer unavailable — using the stored copy below.';
+        }
+        liveReceiver = null;
+      }
+    });
+  } catch (err) {
+    liveBtn.hidden = true;
+    liveEl.textContent = 'Sender is offline — using the stored copy below.';
+    liveReceiver = null;
+  }
+}
+
+function requestOneLiveFile(path) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      if (liveFileResolver && liveFileResolver.path === path) liveFileResolver = null;
+      reject(new Error('Live transfer timed out.'));
+    }, 10 * 60 * 1000);
+    liveFileResolver = {
+      path,
+      resolve: blob => { clearTimeout(timer); resolve(blob); }
+    };
+    liveReceiver.requestFile(path);
+  });
+}
+
+function saveBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
+}
+
+async function downloadLive() {
+  const btn = $('liveDownload');
+  const liveEl = $('liveStatus');
+  if (!liveReceiver || !currentShareData) return;
+  const files = currentShareData.files || [];
+  if (!files.length) return;
+  btn.disabled = true;
+  const received = [];
+  try {
+    let done = 0;
+    for (const f of files) {
+      liveEl.textContent = `Live: receiving ${f.path} (${done + 1}/${files.length})…`;
+      const blob = await requestOneLiveFile(f.path);
+      received.push({ path: f.path, blob });
+      done++;
+    }
+    const data = currentShareData;
+    const isFolder = data.kind === 'folder' && !!data.folderName;
+    if (received.length === 1 && !isFolder && !data.text) {
+      saveBlob(received[0].blob, received[0].path.split('/').pop());
+    } else if (window.JSZip) {
+      const zip = new window.JSZip();
+      for (const r of received) zip.file(r.path, r.blob);
+      if (data.text) zip.file('note.txt', data.text);
+      const zipName = isFolder && data.folderName ? data.folderName : (data.topName || 'unishare');
+      const blob = await zip.generateAsync({ type: 'blob' });
+      saveBlob(blob, `${zipName}.zip`);
+    } else {
+      for (const r of received) saveBlob(r.blob, r.path.split('/').pop());
+    }
+    liveEl.textContent = 'Live transfer complete.';
+    try { liveReceiver.finish(); } catch {}
+    liveReceiver = null;
+    btn.hidden = true;
+  } catch (err) {
+    liveEl.textContent = 'Live transfer failed — use the stored download below.';
+    btn.disabled = false;
+  }
+}
+
+$('liveDownload').addEventListener('click', downloadLive);
+
+window.addEventListener('pagehide', () => {
+  try { if (liveReceiver) liveReceiver.close(); } catch {}
+});
 
 $('pwForm').addEventListener('submit', async e => {
   e.preventDefault();
   const pw = $('pwInput').value;
   if (!pw) return;
+  lastPassword = pw;
   const { status, data } = await api(`/api/share/${shareId}/unlock`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
