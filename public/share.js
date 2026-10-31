@@ -116,7 +116,7 @@ async function connectShare() {
             'The sender was found, but the browsers could not connect directly — usually a restrictive network or firewall. Ask the sender to keep the tab open and try again, ideally on the same Wi-Fi.'
           );
         }
-        return showError('Something went wrong', 'Could not reach the sender. Try reloading the page.');
+        return showError('Something went wrong', `Could not reach the sender. Try reloading the page.${code && !['sender-offline', 'share-not-found', 'share-expired', 'wrong-password'].includes(code) ? ` (${code})` : ''}`);
       }
     });
   } catch (err) {

@@ -20,6 +20,24 @@
 (function (global) {
   const CHUNK_SIZE = 16384; // 16KB chunks
   const BUFFER_HIGH_WATER = 256 * 1024;
+  // Browsers cap a single data-channel message (~256KB). A manifest for a
+  // large folder (or a long text note) can exceed that, and dc.send() then
+  // throws — which surfaced as a generic failure a few seconds after the
+  // listing appeared. Split big JSON messages into small parts instead.
+  const JSON_CHUNK_SIZE = 60000;
+
+  function sendJson(dc, obj) {
+    const s = JSON.stringify(obj);
+    if (s.length <= JSON_CHUNK_SIZE) {
+      dc.send(s);
+      return;
+    }
+    const parts = [];
+    for (let i = 0; i < s.length; i += JSON_CHUNK_SIZE) parts.push(s.slice(i, i + JSON_CHUNK_SIZE));
+    dc.send(JSON.stringify({ t: 'json-start', parts: parts.length }));
+    parts.forEach((data, i) => dc.send(JSON.stringify({ t: 'json-part', i, data })));
+    dc.send(JSON.stringify({ t: 'json-end' }));
+  }
 
   function wsUrl() {
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -127,18 +145,18 @@
         if (msg.t === 'get-file') {
           const entry = filesByPath.get(msg.path);
           if (!entry) {
-            dc.send(JSON.stringify({ t: 'error', message: `File not found: ${msg.path}` }));
+            sendJson(dc, { t: 'error', message: `File not found: ${msg.path}` });
             return;
           }
           await sendFile(dc, entry.file, msg.path, onProgress);
           if (onFileSent) onFileSent(msg.path);
         } else if (msg.t === 'get-text') {
-          dc.send(JSON.stringify({ t: 'text', text }));
+          sendJson(dc, { t: 'text', text });
         } else if (msg.t === 'get-manifest') {
-          dc.send(JSON.stringify({ t: 'manifest', hasText: !!text, listing: listing || null }));
+          sendJson(dc, { t: 'manifest', hasText: !!text, listing: listing || null });
         }
       } catch (err) {
-        try { dc.send(JSON.stringify({ t: 'error', message: err.message })); } catch {}
+        try { sendJson(dc, { t: 'error', message: err.message }); } catch {}
       }
     };
   }
@@ -356,10 +374,27 @@
       }
     });
 
+    let jsonParts = null; // reassembly buffer for chunked JSON messages
+
     function handleChannelMessage(event) {
       if (typeof event.data === 'string') {
         let msg;
         try { msg = JSON.parse(event.data); } catch { return; }
+        // Reassemble a chunked JSON message, then handle it as one message.
+        if (msg.t === 'json-start') {
+          jsonParts = new Array(msg.parts).fill(null);
+          return;
+        }
+        if (msg.t === 'json-part') {
+          if (jsonParts && Number.isInteger(msg.i) && msg.i < jsonParts.length) jsonParts[msg.i] = msg.data;
+          return;
+        }
+        if (msg.t === 'json-end') {
+          if (!jsonParts || jsonParts.some(p => p === null)) { jsonParts = null; return; }
+          const full = jsonParts.join('');
+          jsonParts = null;
+          try { msg = JSON.parse(full); } catch { return; }
+        }
         if (msg.t === 'manifest' && onManifest) onManifest(msg);
         if (msg.t === 'text' && onText) onText(msg.text);
         if (msg.t === 'error') fail(new Error(msg.message || 'transfer-error'));
