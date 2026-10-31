@@ -1,10 +1,3 @@
-databases:
-  - name: unishare-db
-    databaseName: unishare
-    user: unishare
-    plan: free
-    region: singapore
-
 services:
   - type: web
     name: unishare
@@ -19,17 +12,3 @@ services:
         value: "22"
       - key: NODE_ENV
         value: production
-      - key: DATABASE_URL
-        fromDatabase:
-          name: unishare-db
-          property: connectionString
-      - key: STORAGE_DRIVER
-        value: pg
-      - key: UNISHARE_DATA_DIR
-        value: /tmp/unishare
-      - key: MAX_FILE_MB
-        value: "50"
-      - key: MAX_REQUEST_MB
-        value: "100"
-      - key: UNISHARE_SECRET
-        generateValue: true

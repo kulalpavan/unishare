@@ -1,13 +1,12 @@
 const $ = id => document.getElementById(id);
 const shareId = location.pathname.split('/')[2];
-let lastPassword = '';
-let currentShareData = null;
-let liveReceiver = null;
-let liveFileResolver = null;
 
-function api(path, opts) {
-  return fetch(path, opts).then(async res => ({ status: res.status, data: await res.json().catch(() => ({})) }));
-}
+let passwordHash = null;
+let liveReceiver = null;
+let listing = null;
+let liveFileResolver = null;
+let transferNotified = false;
+let downloading = false;
 
 function fmtSize(n) {
   if (n < 1024) return `${n} B`;
@@ -26,36 +25,99 @@ function showError(title, msg) {
   $('errCard').hidden = false;
 }
 
-async function loadShare() {
-  const { status, data } = await api(`/api/share/${shareId}`);
-  if (status === 401) {
-    $('shareCard').hidden = true;
-    $('errCard').hidden = true;
-    $('pwCard').hidden = false;
-    $('pwInput').focus();
+function setLiveStatus(msg) {
+  const el = $('liveStatus');
+  if (!el) return;
+  el.hidden = false;
+  el.textContent = msg;
+}
+
+function notifyDownloaded() {
+  if (transferNotified || !liveReceiver) return;
+  transferNotified = true;
+  try { liveReceiver.notifyDownloaded(); } catch {}
+}
+
+async function connectShare() {
+  if (!window.UniShareLive || !window.RTCPeerConnection) {
+    showError('Not supported', 'Live sharing needs WebRTC, which this browser does not support.');
     return;
   }
-  if (status === 404) return showError('Share not found', data.error || 'This link is invalid.');
-  if (status === 410) return showError('Share expired', data.error || 'This share has expired.');
-  if (!status.toString().startsWith('2')) return showError('Something went wrong', data.error || 'Try again.');
-
-  $('pwCard').hidden = true;
+  try { if (liveReceiver) liveReceiver.close(); } catch {}
+  liveReceiver = null;
+  transferNotified = false;
   $('errCard').hidden = true;
+  $('pwCard').hidden = true;
+  $('shareCard').hidden = true;
+  setLiveStatus('Connecting to the sender…');
 
+  try {
+    liveReceiver = await window.UniShareLive.startReceiver({
+      id: shareId,
+      passwordHash,
+      timeoutMs: 8000,
+      onStatus: msg => setLiveStatus(msg),
+      onManifest: msg => {
+        listing = msg.listing || { kind: 'files', files: [], hasText: !!msg.hasText };
+        renderListing(listing);
+        setLiveStatus('Connected directly to the sender.');
+        if (listing.hasText) liveReceiver.requestText();
+      },
+      onText: text => {
+        $('textContent').textContent = text;
+        $('textBlock').hidden = false;
+        if (listing && listing.kind === 'note') notifyDownloaded();
+      },
+      onFileStart: (path, size) => setLiveStatus(`Receiving ${path}…`),
+      onFileProgress: (path, done, total) =>
+        setLiveStatus(`Receiving ${path} — ${Math.round((done / total) * 100)}%`),
+      onFileComplete: (path, size, blob) => {
+        if (liveFileResolver && liveFileResolver.path === path) {
+          const r = liveFileResolver;
+          liveFileResolver = null;
+          r.resolve(blob);
+        }
+      },
+      onError: err => {
+        const code = err && err.message;
+        if (code === 'wrong-password') {
+          $('pwStatus').textContent = passwordHash ? 'Wrong password.' : '';
+          $('shareCard').hidden = true;
+          $('errCard').hidden = true;
+          $('pwCard').hidden = false;
+          $('pwInput').focus();
+          setLiveStatus('');
+          $('liveStatus').hidden = true;
+          return;
+        }
+        if (code === 'share-expired') {
+          return showError('Share expired', 'This share has expired.');
+        }
+        if (code === 'sender-offline' || code === 'share-not-found') {
+          return showError(
+            'Sender is offline',
+            'This link only works while the sender keeps the tab open. Ask them to create the link again.'
+          );
+        }
+        return showError('Something went wrong', 'Could not reach the sender. Try reloading the page.');
+      }
+    });
+  } catch (err) {
+    showError(
+      'Sender is offline',
+      'This link only works while the sender keeps the tab open. Ask them to create the link again.'
+    );
+  }
+}
+
+function renderListing(data) {
   const isFolder = data.kind === 'folder' && !!data.folderName;
   const files = data.files || [];
 
   $('shareTitle').textContent = isFolder ? data.folderName : (data.topName || 'Shared content');
-  $('shareTagline').textContent = isFolder ? 'Folder · read-only · one link' : 'Read-only · one link';
-  $('shareMeta').textContent = [
-    new Date(data.createdAt).toLocaleString(),
-    data.expiresAt ? `expires ${new Date(data.expiresAt).toLocaleString()}` : 'never expires'
-  ].join(' · ');
+  $('shareTagline').textContent = isFolder ? 'Folder · live P2P · one link' : 'Live P2P · one link';
+  $('shareMeta').textContent = 'Shared live from the sender\'s browser — no server storage';
 
-  if (data.text) {
-    $('textContent').textContent = data.text;
-    $('textBlock').hidden = false;
-  }
   if (files.length) {
     $('filesHeading').textContent = isFolder ? 'FOLDER' : 'FILES';
     $('fileTable').classList.toggle('tree', isFolder);
@@ -73,10 +135,14 @@ async function loadShare() {
     for (const f of files) {
       const tr = document.createElement('tr');
       const a = document.createElement('a');
-      a.href = `/s/${shareId}/file?path=${encodeURIComponent(f.path)}`;
+      a.href = '#';
       a.textContent = isFolder && f.path.startsWith(`${data.folderName}/`)
         ? f.path.slice(data.folderName.length + 1)
         : f.path;
+      a.addEventListener('click', e => {
+        e.preventDefault();
+        downloadLive([f.path]);
+      });
       const td1 = document.createElement('td');
       td1.appendChild(a);
       const td2 = document.createElement('td');
@@ -89,7 +155,6 @@ async function loadShare() {
   }
 
   const dl = $('downloadAll');
-  dl.href = `/s/${shareId}/download`;
   if (isFolder) {
     dl.textContent = `↓ Download folder (${data.folderName}.zip)`;
     dl.setAttribute('download', `${data.folderName}.zip`);
@@ -97,62 +162,9 @@ async function loadShare() {
     dl.removeAttribute('download');
     dl.textContent = files.length
       ? `↓ Download all (${files.length} file${files.length > 1 ? 's' : ''})`
-      : (data.text ? '↓ Download note' : '↓ Download');
+      : (data.hasText ? '↓ Download note' : '↓ Download');
   }
   $('shareCard').hidden = false;
-  currentShareData = data;
-  tryLive(data);
-}
-
-// --- Live P2P download (hybrid mode) ---------------------------------------
-// If the sender's tab is still open, files stream straight from their browser
-// over WebRTC. Otherwise the stored HTTP download above is the fallback.
-
-async function tryLive(data) {
-  const liveEl = $('liveStatus');
-  const liveBtn = $('liveDownload');
-  if (!liveEl || !liveBtn) return;
-  liveBtn.hidden = true;
-  const files = data.files || [];
-  if (!window.UniShareLive || !window.RTCPeerConnection || !files.length) return;
-  try { if (liveReceiver) liveReceiver.close(); } catch {}
-  liveReceiver = null;
-  liveEl.hidden = false;
-  liveEl.textContent = 'Checking for a live sender…';
-  try {
-    liveReceiver = await window.UniShareLive.startReceiver({
-      id: shareId,
-      password: lastPassword,
-      timeoutMs: 5000,
-      onStatus: msg => { liveEl.textContent = msg; },
-      onManifest: () => {
-        liveEl.textContent = 'Live sender online — files can stream straight from their browser.';
-        liveBtn.hidden = false;
-      },
-      onFileComplete: (path, size, blob) => {
-        if (liveFileResolver && liveFileResolver.path === path) {
-          const r = liveFileResolver;
-          liveFileResolver = null;
-          r.resolve(blob);
-        }
-      },
-      onError: err => {
-        liveBtn.hidden = true;
-        if (err && err.message === 'sender-offline') {
-          liveEl.textContent = 'Sender is offline — using the stored copy below.';
-        } else if (err && err.message === 'wrong-password') {
-          liveEl.hidden = true;
-        } else {
-          liveEl.textContent = 'Live transfer unavailable — using the stored copy below.';
-        }
-        liveReceiver = null;
-      }
-    });
-  } catch (err) {
-    liveBtn.hidden = true;
-    liveEl.textContent = 'Sender is offline — using the stored copy below.';
-    liveReceiver = null;
-  }
 }
 
 function requestOneLiveFile(path) {
@@ -180,73 +192,60 @@ function saveBlob(blob, filename) {
   setTimeout(() => URL.revokeObjectURL(url), 5000);
 }
 
-async function downloadLive() {
-  const btn = $('liveDownload');
-  const liveEl = $('liveStatus');
-  if (!liveReceiver || !currentShareData) return;
-  const files = currentShareData.files || [];
+async function downloadLive(paths) {
+  if (!liveReceiver || !listing || downloading) return;
+  const files = (listing.files || []).filter(f => paths.includes(f.path));
   if (!files.length) return;
-  btn.disabled = true;
+  downloading = true;
   const received = [];
   try {
     let done = 0;
     for (const f of files) {
-      liveEl.textContent = `Live: receiving ${f.path} (${done + 1}/${files.length})…`;
+      setLiveStatus(`Receiving ${f.path} (${done + 1}/${files.length})…`);
       const blob = await requestOneLiveFile(f.path);
       received.push({ path: f.path, blob });
       done++;
     }
-    const data = currentShareData;
-    const isFolder = data.kind === 'folder' && !!data.folderName;
-    if (received.length === 1 && !isFolder && !data.text) {
+    const isFolder = listing.kind === 'folder' && !!listing.folderName;
+    const singleOnly = received.length === 1 && !isFolder && files.length === 1
+      && (listing.files || []).length === 1 && !listing.hasText;
+    if (singleOnly) {
       saveBlob(received[0].blob, received[0].path.split('/').pop());
     } else if (window.JSZip) {
       const zip = new window.JSZip();
       for (const r of received) zip.file(r.path, r.blob);
-      if (data.text) zip.file('note.txt', data.text);
-      const zipName = isFolder && data.folderName ? data.folderName : (data.topName || 'unishare');
+      const zipName = isFolder && listing.folderName ? listing.folderName : (listing.topName || 'unishare');
       const blob = await zip.generateAsync({ type: 'blob' });
       saveBlob(blob, `${zipName}.zip`);
     } else {
       for (const r of received) saveBlob(r.blob, r.path.split('/').pop());
     }
-    liveEl.textContent = 'Live transfer complete.';
-    try { liveReceiver.finish(); } catch {}
-    liveReceiver = null;
-    btn.hidden = true;
+    setLiveStatus('✓ Download complete. The sender has been notified.');
+    notifyDownloaded();
   } catch (err) {
-    liveEl.textContent = 'Live transfer failed — use the stored download below.';
-    btn.disabled = false;
+    setLiveStatus('Download failed — the sender may have closed the tab. Ask them to share again.');
+  } finally {
+    downloading = false;
   }
 }
 
-$('liveDownload').addEventListener('click', downloadLive);
-
-window.addEventListener('pagehide', () => {
-  try { if (liveReceiver) liveReceiver.close(); } catch {}
+$('downloadAll').addEventListener('click', e => {
+  e.preventDefault();
+  const files = (listing && listing.files) || [];
+  downloadLive(files.map(f => f.path));
 });
 
 $('pwForm').addEventListener('submit', async e => {
   e.preventDefault();
   const pw = $('pwInput').value;
-  if (!pw) return;
-  lastPassword = pw;
-  const { status, data } = await api(`/api/share/${shareId}/unlock`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ password: pw })
-  });
-  if (status === 401) {
-    $('pwStatus').textContent = data.error || 'Wrong password.';
-    $('pwInput').focus();
-    return;
-  }
-  if (!status.toString().startsWith('2')) {
-    $('pwStatus').textContent = data.error || 'Unlock failed.';
-    return;
-  }
+  if (!pw || !window.UniShareLive) return;
   $('pwStatus').textContent = '';
-  loadShare();
+  passwordHash = await window.UniShareLive.sha256Hex(pw);
+  connectShare();
+});
+
+window.addEventListener('pagehide', () => {
+  try { if (liveReceiver) liveReceiver.close(); } catch {}
 });
 
 function tickClock() {
@@ -284,16 +283,17 @@ function copyCurrent() {
   });
 }
 
-function downloadAll() {
+function downloadAllAction() {
   if ($('shareCard').hidden) {
     if (!$('pwCard').hidden) $('pwInput').focus();
     return;
   }
-  $('downloadAll').click();
+  const files = (listing && listing.files) || [];
+  downloadLive(files.map(f => f.path));
 }
 
 const actions = {
-  download: () => downloadAll(),
+  download: () => downloadAllAction(),
   copy: () => copyCurrent(),
   palette: () => openPalette()
 };
@@ -307,7 +307,7 @@ document.querySelectorAll('[data-action]').forEach(el => {
 });
 
 const commands = [
-  { label: 'Download all', hint: 'DOWNLOAD', run: () => downloadAll() },
+  { label: 'Download all', hint: 'DOWNLOAD', run: () => downloadAllAction() },
   { label: 'Copy share link', hint: 'COPY', run: () => copyCurrent() },
   { label: 'Focus password field', hint: 'UNLOCK', run: () => $('pwInput').focus() },
   { label: 'Reload this share', hint: 'REFRESH', run: () => location.reload() },
@@ -400,4 +400,4 @@ document.addEventListener('keydown', e => {
   }
 });
 
-loadShare();
+connectShare();

@@ -290,6 +290,10 @@ select {
 }
 .status:not(:empty) { padding: 9px 10px; border-color: var(--ink); background: var(--cyan); box-shadow: 4px 4px 0 var(--ink); }
 .status.err { background: var(--red); }
+.status.warn { background: var(--yellow); }
+.status.ok { background: var(--lime); }
+.live-files { margin: 12px 0 0; }
+.live-files li.done { color: var(--muted); text-decoration: line-through; }
 .shortcut-note {
   margin-top: 18px;
   padding-top: 10px;

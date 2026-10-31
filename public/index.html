@@ -85,20 +85,25 @@
         <div class="win-controls" aria-hidden="true"><span></span><span></span><span></span></div>
       </div>
       <div class="window-body">
-        <h2 class="win-h2">Share ready</h2>
+        <h2 class="win-h2">Share ready — live from this tab</h2>
         <div class="linkline">
           <a id="shareLink" target="_blank" rel="noopener"></a>
           <button class="btn cyan" id="copyBtn">⧉ Copy</button>
         </div>
         <p class="meta" id="resultMeta"></p>
-        <p class="meta" id="liveStatus" hidden></p>
+        <p class="status warn" id="tabWarning" hidden></p>
+        <p class="status" id="liveStatus" hidden></p>
+        <ul class="picked live-files" id="liveFiles" hidden></ul>
+        <div class="btn-row">
+          <button class="btn" id="stopShareBtn" hidden>■ Stop sharing</button>
+        </div>
       </div>
     </section>
 
     <p class="hintbar">
       <span><kbd>CTRL</kbd> + <kbd>K</kbd> Command palette</span>
       <span>Drag &amp; drop anywhere in the window</span>
-      <span>Links open for anyone</span>
+      <span>100% peer-to-peer — keep this tab open until the receiver downloads</span>
     </p>
   </main>
 

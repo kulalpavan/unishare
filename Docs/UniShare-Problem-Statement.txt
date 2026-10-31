@@ -31,46 +31,52 @@ PROPOSED SOLUTION
 -----------------
 Build a web application ("UniShare") with the following flow:
 
-Upload -> Store -> Generate link -> Share -> Verify password (optional) -> Download
+Pick files/folder/text -> Generate link -> Share -> Verify password (optional)
+-> Download live, peer-to-peer
 
 Frontend:
-- A clean upload page where the user selects files, a folder, or types text.
+- A clean page where the user selects files, a folder, or types text.
 - Options to set a password and (optionally) an expiry time for the share.
-- After upload, show the generated share link with a copy button.
+- After creating the link, show it with a copy button, a "don't close this
+  tab" warning, and live download status (receiver connected, per-file
+  progress, and confirmation once the receiver has downloaded everything).
 
 Backend:
-- Receives the uploaded files/folders/text and stores them under a unique
-  share ID.
+- Serves the frontend and runs a lightweight WebSocket signaling hub that
+  introduces the sender's and receiver's browsers.
+- No database and no file storage. File bytes and text stream directly
+  between browsers over WebRTC data channels in 16 KB chunks.
 - Returns a short, unique share URL such as:
     https://<domain>/s/<share-id>
-- Stores share metadata: share ID, content type, file name(s), creation time,
-  optional expiry, and password hash (never the plain password).
-- Streaming download endpoint so large files and folders are downloaded
-  directly (folders served as a ZIP archive).
+- A share lives only while the sender's tab stays open. Closing the tab
+  ends the share immediately.
+- Rooms are ephemeral in-memory mappings holding the file listing, the
+  password hash (never the plain password), and the expiry time.
 
 Password protection:
 - If a share has a password, the link opens a password prompt first.
-- The password is verified on the server (hashed, e.g. bcrypt/argon2).
-- After successful verification, a short-lived token/cookie grants access to
-  view/download that share's content.
+- The password is verified by comparing SHA-256 hashes; the plaintext
+  password never leaves the browser that typed it.
 - Non-password shares open directly.
 
 Recipient experience:
 - Open link -> (enter password if required) -> preview text or see file/folder
-  list -> download directly, no sign-up needed.
+  list -> download directly from the sender's browser, no sign-up needed.
+- After the download completes, the sender is notified automatically.
 
 Suggested tech stack (can be adjusted):
-- Frontend: React / Next.js
-- Backend: Node.js API (or Next.js API routes)
-- Database: PostgreSQL or SQLite for share metadata
-- File storage: local disk for development, S3-compatible storage for
-  production
-- Passwords: bcrypt or argon2 hashing
-- Cleanup: scheduled job to delete expired shares and their files
+- Frontend: plain HTML/CSS/vanilla JS, no build step
+- Backend: Node.js + Express (static files) + WebSocket signaling
+- Real-time transfer: WebRTC data channels (+ STUN/TURN for NAT traversal)
+- Passwords: SHA-256 hash comparison
+- Cleanup: rooms expire on sender disconnect, on expiry, or after 24 hours
 
 Key considerations:
-- Large uploads need chunked/streamed handling.
-- Folders should preserve their internal structure and be delivered as ZIP.
+- The sender must keep the tab open until the receiver finishes downloading.
+- Large files need chunked handling with data-channel backpressure.
+- Folders should preserve their internal structure and be delivered as ZIP
+  (rebuilt in the receiver's browser).
 - Share links should be hard to guess (random, high-entropy IDs).
-- Optional expiry and download limits add control over shared content.
-- Basic abuse protection (size limits, rate limits) for a public deployment.
+- Symmetric NATs need a TURN server fallback for direct connections.
+- Basic abuse protection (message size limits, one sender per room) for a
+  public deployment.

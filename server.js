@@ -1,41 +1,30 @@
 'use strict';
 
+// UniShare — pure peer-to-peer edition.
+//
+// The server is only two things:
+//   1. A static file server for the frontend.
+//   2. A WebSocket signaling hub (/live) that introduces the sender's and
+//      receiver's browsers so they can connect directly over WebRTC.
+//
+// There is no database and no file storage. File bytes and text never touch
+// this server — they stream browser-to-browser over WebRTC data channels.
+// A share lives only while the sender's tab stays open; closing the tab
+// ends the share. Passwords are verified by comparing SHA-256 hashes, so
+// the server never sees a plaintext password.
+
 const path = require('path');
-const fs = require('fs');
 const crypto = require('crypto');
 const http = require('http');
 
 const express = require('express');
-const multer = require('multer');
-const bcrypt = require('bcryptjs');
-const rateLimit = require('express-rate-limit');
 const { WebSocketServer } = require('ws');
 
-const db = require('./db');
-const storage = require('./storage');
-
 const PORT = Number(process.env.PORT || 3000);
-const DATA_DIR = process.env.UNISHARE_DATA_DIR
-  ? path.resolve(process.env.UNISHARE_DATA_DIR)
-  : path.join(__dirname, 'data');
-const UPLOAD_TMP_DIR = path.join(DATA_DIR, 'tmp');
-const MAX_FILE_MB = Number(process.env.MAX_FILE_MB || 200);
-const MAX_REQUEST_MB = Number(process.env.MAX_REQUEST_MB || 500);
-const BCRYPT_ROUNDS = 10;
-const UNLOCK_COOKIE_TTL_SECONDS = 600;
-const COOKIE_SECURE = process.env.NODE_ENV === 'production' || process.env.COOKIE_SECURE === 'true';
-const EXPIRY_UNITS = { minutes: 60e3, hours: 3600e3, days: 86400e3 };
-
-fs.mkdirSync(UPLOAD_TMP_DIR, { recursive: true });
-
-const SECRET_PATH = path.join(DATA_DIR, '.secret');
-let SERVER_SECRET = process.env.UNISHARE_SECRET || '';
-if (!SERVER_SECRET) {
-  SERVER_SECRET = fs.existsSync(SECRET_PATH)
-    ? fs.readFileSync(SECRET_PATH, 'utf8').trim()
-    : crypto.randomBytes(32).toString('hex');
-  if (!fs.existsSync(SECRET_PATH)) fs.writeFileSync(SECRET_PATH, SERVER_SECRET);
-}
+const ID_RE = /^[A-Za-z0-9_-]{8,64}$/;
+const HASH_RE = /^[0-9a-f]{64}$/;
+const MAX_SIGNAL_BYTES = 256 * 1024;
+const ROOM_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
 const app = express();
 app.disable('x-powered-by');
@@ -46,116 +35,11 @@ app.use(express.json());
 app.use((req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('Referrer-Policy', 'no-referrer');
-  if (COOKIE_SECURE) res.setHeader('Strict-Transport-Security', 'max-age=15552000; includeSubDomains');
+  if (process.env.NODE_ENV === 'production') {
+    res.setHeader('Strict-Transport-Security', 'max-age=15552000; includeSubDomains');
+  }
   next();
 });
-
-const uploadLimiter = rateLimit({
-  windowMs: 60 * 60 * 1000,
-  limit: Number(process.env.UPLOAD_RATE_LIMIT || 30),
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { error: 'Too many uploads. Try again later.' }
-});
-
-const unlockLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  limit: Number(process.env.UNLOCK_RATE_LIMIT || 10),
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { error: 'Too many password attempts. Try again later.' }
-});
-
-const upload = multer({
-  storage: multer.diskStorage({
-    destination: UPLOAD_TMP_DIR,
-    filename: (req, file, cb) => cb(null, `${Date.now()}-${crypto.randomBytes(8).toString('hex')}`)
-  }),
-  limits: { fileSize: MAX_FILE_MB * 1024 * 1024, files: 1000 }
-});
-
-function sign(payload) {
-  return crypto.createHmac('sha256', SERVER_SECRET).update(payload).digest('hex');
-}
-
-function makeId() {
-  return crypto.randomBytes(16).toString('base64url');
-}
-
-function statusFor(share) {
-  return share.expires_at !== null && share.expires_at <= Date.now() ? 'expired' : 'ok';
-}
-
-function authCookieName(id) {
-  return `us_${id.replace(/[^A-Za-z0-9_-]/g, '')}`;
-}
-
-function makeAuthToken(id) {
-  const exp = Date.now() + UNLOCK_COOKIE_TTL_SECONDS * 1000;
-  return { value: `${exp}.${sign(`${id}.${exp}`)}`, exp };
-}
-
-function checkAuthToken(id, token) {
-  if (typeof token !== 'string') return false;
-  const sep = token.indexOf('.');
-  if (sep < 0) return false;
-  const exp = Number(token.slice(0, sep));
-  if (!Number.isFinite(exp) || exp <= Date.now()) return false;
-  const expected = Buffer.from(sign(`${id}.${exp}`));
-  const given = Buffer.from(token.slice(sep + 1));
-  if (expected.length !== given.length) return false;
-  return crypto.timingSafeEqual(expected, given);
-}
-
-function isUnlocked(req, share) {
-  if (!share.password_hash) return true;
-  return checkAuthToken(share.id, req.cookies[authCookieName(share.id)]);
-}
-
-function requireAccessible(req, res, share) {
-  if (!share) { res.status(404).json({ error: 'Share not found.' }); return false; }
-  if (statusFor(share) === 'expired') {
-    res.status(410).json({ error: 'This share has expired.' });
-    return false;
-  }
-  if (!isUnlocked(req, share)) {
-    res.status(401).json({ error: 'Password required.', locked: true });
-    return false;
-  }
-  return true;
-}
-
-const cookieParser = (req, res, next) => {
-  const jar = {};
-  const header = req.headers.cookie;
-  if (header) {
-    for (const part of header.split(';')) {
-      const i = part.indexOf('=');
-      if (i > 0) {
-        const name = part.slice(0, i).trim();
-        const value = part.slice(i + 1).trim();
-        try { jar[name] = decodeURIComponent(value); } catch { jar[name] = value; }
-      }
-    }
-  }
-  req.cookies = jar;
-  next();
-};
-
-app.use(cookieParser);
-
-const wrap = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
-
-function cleanupTemp(files) {
-  for (const f of files || []) {
-    try { fs.unlinkSync(f.path); } catch {}
-  }
-}
-
-app.get('/api/health', wrap(async (req, res) => {
-  await db.pool.query('SELECT 1');
-  res.json({ ok: true, storage: storage.driver, liveRooms: liveRooms.size });
-}));
 
 // ICE servers for WebRTC peer connections. Configure via ICE_SERVERS env var
 // (JSON array). Defaults to Google's free public STUN server; add a free TURN
@@ -168,255 +52,13 @@ function iceServers() {
   return [{ urls: 'stun:stun.l.google.com:19302' }];
 }
 
+app.get('/api/health', (req, res) => {
+  res.json({ ok: true, mode: 'p2p', liveRooms: liveRooms.size });
+});
+
 app.get('/api/ice', (req, res) => {
   res.json({ iceServers: iceServers() });
 });
-
-async function shareListing(share) {
-  return storage.list(share.id);
-}
-
-function uploadSizeGuard(req, res, next) {
-  const length = Number(req.headers['content-length']);
-  if (Number.isFinite(length) && length > MAX_REQUEST_MB * 1024 * 1024) {
-    return res.status(413).json({ error: `Upload too large (limit ${MAX_REQUEST_MB} MB per request).` });
-  }
-  next();
-}
-
-app.post('/api/upload', uploadSizeGuard, uploadLimiter, (req, res, next) => {  upload.array('files', 1000)(req, res, err => {
-    if (err) {
-      cleanupTemp(req.files);
-      const msg = err.code === 'LIMIT_FILE_SIZE'
-        ? `File too large (limit ${MAX_FILE_MB} MB).`
-        : `Upload error: ${err.message}`;
-      return res.status(400).json({ error: msg });
-    }
-    handleUpload(req, res).catch(next);
-  });
-});
-
-async function handleUpload(req, res) {
-  const files = req.files || [];
-  const paths = req.body.paths;
-  const relPaths = (typeof paths === 'string' ? [paths] : paths) || files.map(() => '');
-  const text = typeof req.body.text === 'string' ? req.body.text : '';
-  const password = typeof req.body.password === 'string' ? req.body.password : '';
-  const id = makeId();
-  const saved = [];
-  let committed = false;
-
-  try {
-    if (files.length && relPaths.length !== files.length) {
-      return res.status(400).json({ error: 'paths/files mismatch.' });
-    }
-    if (!files.length && !text.trim()) {
-      return res.status(400).json({ error: 'Nothing to share: add files, a folder, or text.' });
-    }
-    if (password.length > 200) {
-      return res.status(400).json({ error: 'Password too long.' });
-    }
-
-    let expiresInMs = null;
-    const evVal = Number(req.body.expiryValue);
-    const evUnit = req.body.expiryUnit;
-    if (evVal > 0 && EXPIRY_UNITS[evUnit]) {
-      expiresInMs = Math.round(evVal * EXPIRY_UNITS[evUnit]);
-    }
-
-    for (let i = 0; i < files.length; i++) {
-      const rel = storage.sanitizeRel(relPaths[i] || '');
-      if (!rel) {
-        return res.status(400).json({ error: `Unsafe or missing path for file ${i + 1}.` });
-      }
-      await storage.put(id, rel, files[i].path, files[i].mimetype);
-      saved.push(rel);
-    }
-
-    const requestedKind = typeof req.body.kind === 'string' ? req.body.kind : '';
-    let kind;
-    let folderName = null;
-    if (files.length === 0) {
-      kind = 'note';
-    } else {
-      const tops = new Set(saved.map(p => p.split('/')[0]));
-      const allNested = saved.every(p => p.includes('/'));
-      if (requestedKind === 'folder' || (requestedKind !== 'files' && tops.size === 1 && allNested)) {
-        if (tops.size !== 1 || !allNested) {
-          return res.status(400).json({ error: 'A folder upload must keep its files inside one top-level folder.' });
-        }
-        kind = 'folder';
-        folderName = saved[0].split('/')[0];
-      } else {
-        kind = 'files';
-      }
-    }
-
-    let topName;
-    if (kind === 'note') topName = 'note.txt';
-    else if (kind === 'folder') topName = folderName;
-    else if (saved.length === 1) topName = path.posix.basename(saved[0]);
-    else topName = 'files';
-
-    const passwordHash = password ? await bcrypt.hash(password, BCRYPT_ROUNDS) : null;
-    const now = Date.now();
-    const expiresAt = expiresInMs !== null ? now + expiresInMs : null;
-    await db.createShare({
-      id,
-      topName,
-      kind,
-      folderName,
-      text: text || null,
-      passwordHash,
-      createdAt: now,
-      expiresAt
-    });
-    committed = true;
-
-    res.status(201).json({
-      id,
-      url: `/s/${id}`,
-      kind,
-      folderName,
-      locked: !!passwordHash,
-      expiresAt
-    });
-  } finally {
-    cleanupTemp(files);
-    if (!committed) {
-      try { await storage.remove(id); } catch (err) { console.error(`[upload] cleanup failed for ${id}: ${err.message}`); }
-    }
-  }
-}
-
-app.get('/api/share/:id', wrap(async (req, res) => {
-  const share = await db.getShare(req.params.id);
-  if (!share) return res.status(404).json({ error: 'Share not found.' });
-  if (statusFor(share) === 'expired') return res.status(410).json({ error: 'This share has expired.' });
-
-  if (share.password_hash && !isUnlocked(req, share)) {
-    return res.status(401).json({ error: 'Password required.', locked: true });
-  }
-
-  res.json({
-    id: share.id,
-    topName: share.top_name,
-    kind: share.kind || 'files',
-    folderName: share.folder_name || null,
-    text: share.text,
-    files: await shareListing(share),
-    createdAt: share.created_at,
-    expiresAt: share.expires_at
-  });
-}));
-
-app.post('/api/share/:id/unlock', unlockLimiter, wrap(async (req, res) => {
-  const share = await db.getShare(req.params.id);
-  if (!share) return res.status(404).json({ error: 'Share not found.' });
-  if (statusFor(share) === 'expired') return res.status(410).json({ error: 'This share has expired.' });
-  if (!share.password_hash) return res.json({ unlocked: true });
-
-  const password = req.body && typeof req.body.password === 'string' ? req.body.password : '';
-  if (!password.length) return res.status(400).json({ error: 'Password required.' });
-  if (!(await bcrypt.compare(password, share.password_hash))) {
-    return res.status(401).json({ error: 'Wrong password.' });
-  }
-
-  const token = makeAuthToken(share.id);
-  const cookie = `${authCookieName(share.id)}=${encodeURIComponent(token.value)}; HttpOnly; SameSite=Lax; Max-Age=${UNLOCK_COOKIE_TTL_SECONDS}${COOKIE_SECURE ? '; Secure' : ''}`;
-  res.setHeader('Set-Cookie', [
-    `${cookie}; Path=/s/${share.id}`,
-    `${cookie}; Path=/api/share/${share.id}`,
-    `${cookie}; Path=/d/${share.id}`
-  ]);
-  res.json({ unlocked: true });
-}));
-
-async function sendSingleFile(res, share, rel) {
-  const safe = storage.sanitizeRel(rel);
-  if (!safe) return res.status(400).end();
-  let file;
-  try {
-    file = await storage.openFile(share.id, safe);
-  } catch (err) {
-    if (err.code === 'ENOENT') return res.status(404).end();
-    throw err;
-  }
-  res.setHeader('Content-Type', 'application/octet-stream');
-  res.setHeader('Content-Length', file.size);
-  res.setHeader('Content-Disposition',
-    `attachment; filename*=UTF-8''${encodeURI(path.posix.basename(safe))}`);
-  file.stream.on('error', () => res.destroy());
-  file.stream.pipe(res);
-}
-
-async function streamZip(res, share, listing) {
-  const files = listing || await shareListing(share);
-  const zipName = share.kind === 'folder' && share.folder_name
-    ? share.folder_name
-    : (share.top_name || 'unishare');
-
-  res.setHeader('Content-Type', 'application/zip');
-  res.setHeader('Content-Disposition',
-    `attachment; filename*=UTF-8''${encodeURI(zipName)}.zip`);
-  const { ZipArchive } = await import('archiver');
-  const zip = new ZipArchive({ store: true });
-  zip.on('error', () => res.destroy());
-  zip.pipe(res);
-  try {
-    for (const f of files) {
-      const file = await storage.openFile(share.id, f.path);
-      file.stream.on('error', () => res.destroy());
-      zip.append(file.stream, { name: f.path });
-    }
-    if (share.text) zip.append(Buffer.from(share.text), { name: 'note.txt' });
-    await zip.finalize();
-  } catch (err) {
-    zip.abort();
-    res.destroy();
-    throw err;
-  }
-}
-
-async function shareDownload(req, res) {
-  const share = await db.getShare(req.params.id);
-  if (!requireAccessible(req, res, share)) return;
-
-  const files = await shareListing(share);
-  if (share.kind === 'folder') return streamZip(res, share, files);
-
-  if (files.length === 0 && share.text) {
-    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-    res.setHeader('Content-Disposition',
-      `attachment; filename*=UTF-8''${encodeURI(share.top_name || 'note.txt')}`);
-    return res.send(share.text);
-  }
-
-  if (files.length === 1 && !share.text) {
-    return sendSingleFile(res, share, files[0].path);
-  }
-
-  return streamZip(res, share, files);
-}
-
-app.get('/s/:id/download', wrap(shareDownload));
-app.get('/d/:id', wrap(shareDownload));
-
-app.get('/s/:id/file', wrap(async (req, res) => {
-  const share = await db.getShare(req.params.id);
-  if (!requireAccessible(req, res, share)) return;
-  const files = await shareListing(share);
-  if (!files.length) return res.status(400).end();
-  await sendSingleFile(res, share, req.query.path || '');
-}));
-
-app.get('/d/:id/file', wrap(async (req, res) => {
-  const share = await db.getShare(req.params.id);
-  if (!requireAccessible(req, res, share)) return;
-  const files = await shareListing(share);
-  if (!files.length) return res.status(400).end();
-  await sendSingleFile(res, share, req.query.path || '');
-}));
 
 app.use(express.static(path.join(__dirname, 'public')));
 
@@ -436,42 +78,14 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: 'Server error.' });
 });
 
-async function cleanupExpired() {
-  const rows = await db.listExpired(Date.now());
-  let removed = 0;
-  for (const row of rows) {
-    try {
-      await storage.remove(row.id);
-      await db.deleteShare(row.id);
-      removed++;
-    } catch (err) {
-      console.error(`[cleanup] failed for ${row.id}: ${err.message}`);
-    }
-  }
-  if (removed) console.log(`[cleanup] removed ${removed} expired share(s)`);
-}
-
-function cleanTempDir() {
-  for (const name of fs.readdirSync(UPLOAD_TMP_DIR)) {
-    try { fs.rmSync(path.join(UPLOAD_TMP_DIR, name), { recursive: true, force: true }); } catch {}
-  }
-}
-
 const server = http.createServer(app);
 
 // ---------------------------------------------------------------------------
-// Live P2P signaling hub (hybrid mode).
-//
-// The stored share in PostgreSQL remains the fallback: a receiver first
-// tries to reach the sender live over WebRTC, and falls back to the stored
-// HTTP download when the sender is offline. This hub only relays WebRTC
-// handshake signals between browsers; no file bytes ever pass through it.
-// Rooms are ephemeral in-memory mappings, wiped when connections drop.
+// Signaling hub. Rooms are ephemeral in-memory mappings, wiped when the
+// sender's connection drops or the room expires.
 // ---------------------------------------------------------------------------
 
-const liveRooms = new Map(); // shareId -> { sender, receivers: Map, createdAt, listing }
-const MAX_SIGNAL_BYTES = 256 * 1024;
-const ROOM_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const liveRooms = new Map(); // shareId -> { sender, receivers, listing, passwordHash, expiresAt, createdAt }
 
 const wss = new WebSocketServer({ server, path: '/live', maxPayload: MAX_SIGNAL_BYTES });
 
@@ -481,11 +95,27 @@ function liveSend(ws, obj) {
   }
 }
 
-function getOrCreateRoom(id) {
-  let room = liveRooms.get(id);
-  if (!room) {
-    room = { sender: null, receivers: new Map(), createdAt: Date.now(), listing: null };
-    liveRooms.set(id, room);
+function hashesEqual(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  if (!HASH_RE.test(a) || !HASH_RE.test(b)) return false;
+  return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
+}
+
+function roomExpired(room) {
+  return room.expiresAt !== null && room.expiresAt <= Date.now();
+}
+
+function getLiveRoom(id) {
+  const room = liveRooms.get(id);
+  if (!room) return null;
+  if (roomExpired(room)) {
+    if (room.sender) { try { room.sender.ws.close(); } catch {} }
+    for (const receiver of room.receivers.values()) {
+      liveSend(receiver, { type: 'error', code: 'share-expired' });
+      try { receiver.close(); } catch {}
+    }
+    liveRooms.delete(id);
+    return null;
   }
   return room;
 }
@@ -517,52 +147,55 @@ wss.on('connection', ws => {
 
     try {
       if (msg.type === 'register-sender') {
-        if (typeof msg.id !== 'string' || !/^[A-Za-z0-9_-]{8,64}$/.test(msg.id)) {
+        if (typeof msg.id !== 'string' || !ID_RE.test(msg.id)) {
           return liveSend(ws, { type: 'error', code: 'bad-id' });
         }
-        const room = getOrCreateRoom(msg.id);
-        if (room.sender && room.sender.ws.readyState === room.sender.ws.OPEN) {
+        if (msg.passwordHash != null && !HASH_RE.test(msg.passwordHash)) {
+          return liveSend(ws, { type: 'error', code: 'bad-message' });
+        }
+        const expiresAt = typeof msg.expiresAt === 'number' && msg.expiresAt > Date.now()
+          ? msg.expiresAt
+          : null;
+        let room = liveRooms.get(msg.id);
+        if (room && room.sender && room.sender.ws.readyState === room.sender.ws.OPEN) {
           try { room.sender.ws.close(); } catch {}
         }
-        room.sender = { ws, id: ws._id };
-        room.listing = msg.listing && typeof msg.listing === 'object' ? msg.listing : null;
-        room.createdAt = Date.now();
+        room = {
+          sender: { ws, id: ws._id },
+          receivers: room ? room.receivers : new Map(),
+          listing: msg.listing && typeof msg.listing === 'object' ? msg.listing : null,
+          passwordHash: msg.passwordHash || null,
+          expiresAt,
+          createdAt: Date.now()
+        };
+        liveRooms.set(msg.id, room);
         ws._role = 'sender';
         ws._roomId = msg.id;
         return liveSend(ws, { type: 'registered', iceServers: iceServers() });
       }
 
       if (msg.type === 'join') {
-        if (typeof msg.id !== 'string' || !/^[A-Za-z0-9_-]{8,64}$/.test(msg.id)) {
+        if (typeof msg.id !== 'string' || !ID_RE.test(msg.id)) {
           return liveSend(ws, { type: 'error', code: 'bad-id' });
         }
-        let share;
-        try {
-          share = await db.getShare(msg.id);
-        } catch (err) {
-          console.error('[live] share lookup failed:', err.message);
-          return liveSend(ws, { type: 'error', code: 'server-error' });
+        const room = getLiveRoom(msg.id);
+        if (!room) return liveSend(ws, { type: 'error', code: 'share-not-found' });
+        const senderOnline = !!(room.sender && room.sender.ws.readyState === room.sender.ws.OPEN);
+        if (!senderOnline) return liveSend(ws, { type: 'error', code: 'sender-offline' });
+        if (room.passwordHash && !hashesEqual(room.passwordHash, msg.passwordHash)) {
+          return liveSend(ws, { type: 'error', code: 'wrong-password' });
         }
-        if (!share) return liveSend(ws, { type: 'error', code: 'share-not-found' });
-        if (statusFor(share) === 'expired') return liveSend(ws, { type: 'error', code: 'share-expired' });
-        if (share.password_hash) {
-          const pw = typeof msg.password === 'string' ? msg.password : '';
-          if (!pw || !(await bcrypt.compare(pw, share.password_hash))) {
-            return liveSend(ws, { type: 'error', code: 'wrong-password' });
-          }
-        }
-        const room = getOrCreateRoom(msg.id);
         room.receivers.set(ws._id, ws);
         ws._role = 'receiver';
         ws._roomId = msg.id;
-        const senderOnline = !!(room.sender && room.sender.ws.readyState === room.sender.ws.OPEN);
         liveSend(ws, {
           type: 'joined',
-          senderOnline,
+          senderOnline: true,
           listing: room.listing,
+          expiresAt: room.expiresAt,
           iceServers: iceServers()
         });
-        if (senderOnline) liveSend(room.sender.ws, { type: 'receiver-joined', receiverId: ws._id });
+        liveSend(room.sender.ws, { type: 'receiver-joined', receiverId: ws._id });
         return;
       }
 
@@ -574,6 +207,14 @@ wss.on('connection', ws => {
         } else if (ws._role === 'sender' && typeof msg.to === 'string') {
           const target = room.receivers.get(msg.to);
           if (target) liveSend(target, { type: 'signal', from: ws._id, data: msg.data });
+        }
+        return;
+      }
+
+      if (msg.type === 'transfer-complete') {
+        const room = ws._roomId ? liveRooms.get(ws._roomId) : null;
+        if (room && ws._role === 'receiver' && room.sender) {
+          liveSend(room.sender.ws, { type: 'transfer-complete', receiverId: ws._id });
         }
         return;
       }
@@ -600,8 +241,18 @@ wss.on('connection', ws => {
   });
 });
 
+// Heartbeat + stale-room sweep.
 setInterval(() => {
   for (const [id, room] of liveRooms) {
+    if (roomExpired(room)) {
+      if (room.sender) { try { room.sender.ws.close(); } catch {} }
+      for (const receiver of room.receivers.values()) {
+        liveSend(receiver, { type: 'error', code: 'share-expired' });
+        try { receiver.close(); } catch {}
+      }
+      liveRooms.delete(id);
+      continue;
+    }
     const senderGone = !room.sender || room.sender.ws.readyState !== room.sender.ws.OPEN;
     if (senderGone && room.receivers.size === 0) liveRooms.delete(id);
   }
@@ -612,6 +263,7 @@ setInterval(() => {
   }
 }, 30 * 1000).unref();
 
+// Absolute room age cap.
 setInterval(() => {
   const now = Date.now();
   for (const [id, room] of liveRooms) {
@@ -623,36 +275,14 @@ setInterval(() => {
   }
 }, 5 * 60 * 1000).unref();
 
-let cleaning = false;
-
-async function cleanupOrphans() {
-  const { rowCount } = await db.pool.query(
-    'DELETE FROM share_files sf WHERE NOT EXISTS (SELECT 1 FROM shares s WHERE s.id = sf.share_id)'
-  );
-  if (rowCount) console.log(`[cleanup] removed ${rowCount} orphaned file row(s)`);
-}
-
 async function start() {
-  await db.initWithRetry();
-  storage.init();
-  cleanTempDir();
-  await cleanupOrphans();
-  await cleanupExpired();
   server.listen(PORT, () => {
-    console.log(`UniShare running at http://localhost:${PORT} (db: postgres, storage: ${storage.driver})`);
+    console.log(`UniShare (pure P2P) running at http://localhost:${PORT}`);
   });
-  setInterval(async () => {
-    if (cleaning) return;
-    cleaning = true;
-    try { await cleanupExpired(); } catch (err) { console.error('[cleanup]', err); } finally { cleaning = false; }
-  }, 60 * 1000).unref();
 }
 
 async function shutdown() {
-  server.close(async () => {
-    try { await db.close(); } catch {}
-    process.exit(0);
-  });
+  server.close(() => process.exit(0));
   setTimeout(() => process.exit(1), 10000).unref();
 }
 
@@ -666,4 +296,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { app, server, db, storage, cleanupExpired, start, liveRooms, iceServers, wss };
+module.exports = { app, server, start, liveRooms, iceServers, wss };

@@ -1,26 +1,43 @@
 'use strict';
 
-/* UniShare live P2P transfers (hybrid mode).
+/* UniShare live P2P transfers — pure peer-to-peer edition.
  *
- * The stored share in PostgreSQL remains the fallback. When the sender's tab
- * is still open, the receiver downloads straight from the sender's browser
- * over a WebRTC data channel, relayed only for handshake signaling through
- * the server's /live WebSocket hub. No file bytes pass through the server.
+ * There is no server storage. The sender's tab holds the files and text;
+ * the receiver pulls them over a WebRTC data channel. The server's /live
+ * WebSocket hub only relays handshake signals and presence events.
  *
  * Wire protocol (data channel):
  *   receiver -> sender: { t: 'get-manifest' } | { t: 'get-text' } | { t: 'get-file', path }
  *   sender -> receiver: { t: 'manifest', ... } | { t: 'text', text }
  *                       | { t: 'file-start', path, size } + binary chunks + { t: 'file-end', path }
  *                       | { t: 'error', message }
+ *
+ * Passwords are verified by comparing SHA-256 hashes: the sender registers
+ * the hash, the receiver sends the hash of what was typed, and the server
+ * compares them. Plaintext passwords never leave the browser that typed them.
  */
 
 (function (global) {
-  const CHUNK_SIZE = 16384; // 16KB chunks (see migration blueprint)
+  const CHUNK_SIZE = 16384; // 16KB chunks
   const BUFFER_HIGH_WATER = 256 * 1024;
 
   function wsUrl() {
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     return `${proto}//${location.host}/live`;
+  }
+
+  async function sha256Hex(text) {
+    const data = new TextEncoder().encode(text);
+    const digest = await crypto.subtle.digest('SHA-256', data);
+    return [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, '0')).join('');
+  }
+
+  function makeId() {
+    const bytes = new Uint8Array(16);
+    crypto.getRandomValues(bytes);
+    let bin = '';
+    bytes.forEach(b => { bin += String.fromCharCode(b); });
+    return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
   }
 
   function waitForBufferLow(dc) {
@@ -76,7 +93,7 @@
     return pc;
   }
 
-  function attachSenderChannel(dc, filesByPath, text, onProgress) {
+  function attachSenderChannel(dc, filesByPath, text, listing, onProgress, onFileSent) {
     dc.binaryType = 'arraybuffer';
     dc.onmessage = async event => {
       let msg;
@@ -94,10 +111,11 @@
             return;
           }
           await sendFile(dc, entry.file, msg.path, onProgress);
+          if (onFileSent) onFileSent(msg.path);
         } else if (msg.t === 'get-text') {
           dc.send(JSON.stringify({ t: 'text', text }));
         } else if (msg.t === 'get-manifest') {
-          dc.send(JSON.stringify({ t: 'manifest', hasText: !!text }));
+          dc.send(JSON.stringify({ t: 'manifest', hasText: !!text, listing: listing || null }));
         }
       } catch (err) {
         try { dc.send(JSON.stringify({ t: 'error', message: err.message })); } catch {}
@@ -107,7 +125,10 @@
 
   /* Sender side: keep this tab open and serve the picked files live. */
   async function startSender(opts) {
-    const { id, files, text, listing, onStatus, onReceiverJoin, onProgress } = opts;
+    const {
+      id, files, text, listing, passwordHash, expiresAt,
+      onStatus, onReceiverJoin, onReceiverLeft, onProgress, onFileSent, onTransferComplete
+    } = opts;
     const filesByPath = new Map(files.map(f => [f.path, f]));
     const peers = new Map(); // receiverId -> { pc, dc }
     const socket = new WebSocket(wsUrl());
@@ -121,22 +142,29 @@
       try { msg = JSON.parse(event.data); } catch { return; }
       if (msg.type === 'registered') {
         if (Array.isArray(msg.iceServers) && msg.iceServers.length) iceServers = msg.iceServers;
-        setStatus('Live: this tab is sharing directly. Receivers will download from you while it stays open.');
+        setStatus('Live: waiting for the receiver. Keep this tab open.');
         return;
       }
       if (msg.type === 'receiver-joined') {
         const receiverId = msg.receiverId;
         const pc = makePeerConnection(iceServers, data => {
           socket.send(JSON.stringify({ type: 'signal', to: receiverId, data }));
-        }, dc => attachSenderChannel(dc, filesByPath, text, onProgress));
+        }, dc => attachSenderChannel(dc, filesByPath, text, listing, onProgress, onFileSent));
         peers.set(receiverId, { pc, dc: null });
         if (onReceiverJoin) onReceiverJoin(receiverId);
-        setStatus('Live: a receiver connected. Sending directly from this tab…');
+        setStatus('Receiver connected. Sending directly from this tab…');
         return;
       }
       if (msg.type === 'receiver-left') {
         const peer = peers.get(msg.receiverId);
         if (peer) { try { peer.pc.close(); } catch {} peers.delete(msg.receiverId); }
+        if (onReceiverLeft) onReceiverLeft(msg.receiverId);
+        setStatus('Receiver left. Keep this tab open for another download, or close it to end the share.');
+        return;
+      }
+      if (msg.type === 'transfer-complete') {
+        if (onTransferComplete) onTransferComplete(msg.receiverId);
+        setStatus('✓ Receiver downloaded everything. You can close this tab now.');
         return;
       }
       if (msg.type === 'signal' && msg.from) {
@@ -152,7 +180,7 @@
     });
 
     socket.addEventListener('close', () => {
-      if (!closed) setStatus('Live sharing ended. The stored copy is still available from the link.');
+      if (!closed) setStatus('Live sharing ended. The share link no longer works.');
     });
 
     await new Promise((resolve, reject) => {
@@ -160,7 +188,13 @@
       socket.addEventListener('error', reject, { once: true });
     });
 
-    socket.send(JSON.stringify({ type: 'register-sender', id, listing }));
+    socket.send(JSON.stringify({
+      type: 'register-sender',
+      id,
+      listing,
+      passwordHash: passwordHash || null,
+      expiresAt: expiresAt || null
+    }));
 
     return {
       close() {
@@ -175,7 +209,7 @@
   /* Receiver side: connect to the sender's tab and pull files over WebRTC. */
   async function startReceiver(opts) {
     const {
-      id, password, timeoutMs, onStatus, onManifest, onText, onFileStart,
+      id, passwordHash, timeoutMs, onStatus, onManifest, onText, onFileStart,
       onFileProgress, onFileComplete, onDone, onError
     } = opts;
 
@@ -208,7 +242,7 @@
 
     const joinTimer = setTimeout(() => {
       fail(new Error('sender-offline'));
-    }, timeoutMs || 5000);
+    }, timeoutMs || 8000);
 
     socket.addEventListener('message', event => {
       let msg;
@@ -259,7 +293,6 @@
 
     socket.addEventListener('close', () => {
       if (!settled && pc && pc.connectionState !== 'closed') {
-        // Socket dropped after joining: the live path is gone.
         fail(new Error('sender-offline'));
       }
     });
@@ -294,11 +327,14 @@
       socket.addEventListener('open', resolve, { once: true });
       socket.addEventListener('error', reject, { once: true });
     });
-    socket.send(JSON.stringify({ type: 'join', id, password: password || '' }));
+    socket.send(JSON.stringify({ type: 'join', id, passwordHash: passwordHash || null }));
 
     return {
       requestText() { queueRequest({ t: 'get-text' }); },
       requestFile(path) { queueRequest({ t: 'get-file', path }); },
+      notifyDownloaded() {
+        try { socket.send(JSON.stringify({ type: 'transfer-complete' })); } catch {}
+      },
       finish() {
         settled = true;
         if (onDone) onDone();
@@ -313,5 +349,5 @@
     };
   }
 
-  global.UniShareLive = { startSender, startReceiver };
+  global.UniShareLive = { startSender, startReceiver, sha256Hex, makeId };
 })(window);

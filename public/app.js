@@ -107,6 +107,62 @@ function walkEntry(entry, prefix, files) {
 
 uploadBtn.addEventListener('click', doUpload);
 
+const EXPIRY_UNITS = { minutes: 60e3, hours: 3600e3, days: 86400e3 };
+
+// --- Live P2P share --------------------------------------------------------
+// No upload: files and text stay in this tab. Creating a link registers this
+// tab as the live sender; the receiver downloads straight from here.
+let liveSender = null;
+let liveDone = false;
+let liveFileState = new Map(); // path -> 'waiting' | 'sending' | 'done'
+
+function setLiveStatus(msg, cls) {
+  const el = $('liveStatus');
+  el.hidden = false;
+  el.textContent = msg;
+  el.className = `status ${cls || ''}`.trim();
+}
+
+function renderLiveFiles() {
+  const list = $('liveFiles');
+  list.innerHTML = '';
+  if (!liveFileState.size) { list.hidden = true; return; }
+  list.hidden = false;
+  for (const [p, state] of liveFileState) {
+    const li = document.createElement('li');
+    if (state === 'done') li.className = 'done';
+    li.textContent = state === 'done' ? `✓ ${p}` : state === 'sending' ? `⇅ ${p} — sending…` : `○ ${p} — waiting for receiver`;
+    list.appendChild(li);
+  }
+}
+
+function updateTabWarning() {
+  const warn = $('tabWarning');
+  if (!liveSender || liveDone) { warn.hidden = true; return; }
+  warn.hidden = false;
+  warn.textContent = '⚠ Don\'t close this tab until the receiver has downloaded. The files live only in this tab — closing it ends the share.';
+}
+
+window.addEventListener('beforeunload', e => {
+  if (liveSender && !liveDone) {
+    e.preventDefault();
+    e.returnValue = '';
+  }
+});
+
+window.addEventListener('pagehide', () => {
+  try { if (liveSender) liveSender.close(); } catch {}
+});
+
+$('stopShareBtn').addEventListener('click', () => {
+  try { if (liveSender) liveSender.close(); } catch {}
+  liveSender = null;
+  liveDone = false;
+  $('stopShareBtn').hidden = true;
+  setLiveStatus('Share ended. This link no longer works.', 'err');
+  updateTabWarning();
+});
+
 async function doUpload() {
   const text = textInput.value;
   if (!pickedFiles.length && !text.trim()) {
@@ -119,45 +175,116 @@ async function doUpload() {
     statusEl.classList.add('err');
     return;
   }
+  if (!window.UniShareLive || !window.RTCPeerConnection) {
+    statusEl.textContent = 'Live sharing needs WebRTC, which this browser does not support.';
+    statusEl.classList.add('err');
+    return;
+  }
   uploadBtn.disabled = true;
   statusEl.classList.remove('err');
-  statusEl.textContent = 'Uploading…';
+  statusEl.textContent = 'Creating live share…';
 
   try {
-    const fd = new FormData();
-    for (const f of pickedFiles) {
-      fd.append('files', f, f.name);
-      fd.append('paths', relPath(f));
+    try { if (liveSender) liveSender.close(); } catch {}
+    liveSender = null;
+    liveDone = false;
+
+    const id = window.UniShareLive.makeId();
+    const password = passwordInput.value;
+    const passwordHash = password ? await window.UniShareLive.sha256Hex(password) : null;
+
+    let expiresAt = null;
+    const evVal = Number(expiryValue.value);
+    if (evVal > 0 && EXPIRY_UNITS[expiryUnit.value]) {
+      expiresAt = Date.now() + Math.round(evVal * EXPIRY_UNITS[expiryUnit.value]);
     }
-    fd.append('kind', pickedFiles.length ? pickedKind : 'note');
-    fd.append('text', text);
-    fd.append('password', passwordInput.value);
-    fd.append('expiryValue', expiryValue.value || expiryUnit.value);
-    fd.append('expiryUnit', expiryUnit.value);
 
-    const res = await fetch('/api/upload', { method: 'POST', body: fd });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'Upload failed.');
+    const files = pickedFiles.map(f => ({ file: f, path: relPath(f) }));
+    let kind;
+    let folderName = null;
+    if (!files.length) {
+      kind = 'note';
+    } else {
+      const tops = new Set(files.map(f => f.path.split('/')[0]));
+      const allNested = files.every(f => f.path.includes('/'));
+      if (pickedKind === 'folder' || (pickedKind !== 'files' && tops.size === 1 && allNested)) {
+        if (tops.size !== 1 || !allNested) throw new Error('A folder upload must keep its files inside one top-level folder.');
+        kind = 'folder';
+        folderName = files[0].path.split('/')[0];
+      } else {
+        kind = 'files';
+      }
+    }
+    let topName;
+    if (kind === 'note') topName = 'note.txt';
+    else if (kind === 'folder') topName = folderName;
+    else if (files.length === 1) topName = files[0].path.split('/').pop();
+    else topName = 'files';
 
-    const url = new URL(data.url, location.href).href;
+    const listing = {
+      kind,
+      topName,
+      folderName,
+      files: files.map(f => ({ path: f.path, size: f.file.size })),
+      hasText: !!text.trim()
+    };
+
+    liveFileState = new Map(files.map(f => [f.path, 'waiting']));
+    renderLiveFiles();
+
+    liveSender = await window.UniShareLive.startSender({
+      id,
+      files,
+      text,
+      listing,
+      passwordHash,
+      expiresAt,
+      onStatus: msg => setLiveStatus(msg),
+      onReceiverJoin: () => {
+        setLiveStatus('Receiver connected. Sending directly from this tab…');
+        updateTabWarning();
+      },
+      onReceiverLeft: () => {
+        setLiveStatus('Receiver left. Keep this tab open for another download, or stop sharing below.');
+        updateTabWarning();
+      },
+      onProgress: (path, done, total) => {
+        liveFileState.set(path, 'sending');
+        renderLiveFiles();
+        setLiveStatus(`Sending ${path} — ${Math.round((done / total) * 100)}%`);
+      },
+      onFileSent: path => {
+        liveFileState.set(path, 'done');
+        renderLiveFiles();
+      },
+      onTransferComplete: () => {
+        liveDone = true;
+        for (const p of liveFileState.keys()) liveFileState.set(p, 'done');
+        renderLiveFiles();
+        setLiveStatus('✓ Receiver downloaded everything. You can safely close this tab now.', 'ok');
+        updateTabWarning();
+      }
+    });
+
+    const url = new URL(`/s/${id}`, location.href).href;
     $('shareLink').textContent = url;
     $('shareLink').href = url;
     $('resultMeta').textContent = [
-      data.kind === 'folder' ? `Folder · ${data.folderName}` : (data.kind === 'note' ? 'Text note' : 'Files'),
-      data.locked ? 'Password protected' : 'No password',
-      data.expiresAt ? `Expires ${new Date(data.expiresAt).toLocaleString()}` : 'Never expires'
+      kind === 'folder' ? `Folder · ${folderName}` : (kind === 'note' ? 'Text note' : 'Files'),
+      password ? 'Password protected' : 'No password',
+      expiresAt ? `Expires ${new Date(expiresAt).toLocaleString()}` : 'Never expires',
+      'Live P2P — no server storage'
     ].join(' · ');
     $('result').hidden = false;
+    $('stopShareBtn').hidden = false;
     $('result').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
     statusEl.textContent = '';
+    setLiveStatus('Live: waiting for the receiver. Keep this tab open.');
+    updateTabWarning();
 
     navigator.clipboard.writeText(url).catch(() => {});
-
-    // Hybrid mode: stay live so receivers can pull straight from this tab
-    // over WebRTC. The stored copy remains the fallback when this tab closes.
-    startLiveSender(data, text);
   } catch (err) {
-    statusEl.textContent = err.message;
+    statusEl.textContent = err.message || 'Could not create the share.';
     statusEl.classList.add('err');
   } finally {
     uploadBtn.disabled = false;
@@ -165,45 +292,6 @@ async function doUpload() {
 }
 
 $('copyBtn').addEventListener('click', () => copyLink($('shareLink').textContent));
-
-// --- Live P2P sender -------------------------------------------------------
-let liveSender = null;
-
-async function startLiveSender(share, text) {
-  const liveEl = $('liveStatus');
-  if (!window.UniShareLive || !window.RTCPeerConnection || !liveEl) return;
-  try { if (liveSender) liveSender.close(); } catch {}
-  liveEl.hidden = false;
-  liveEl.textContent = 'Connecting live sharing…';
-  const files = pickedFiles.map(f => ({ file: f, path: relPath(f) }));
-  const listing = {
-    kind: share.kind,
-    topName: share.kind === 'folder' ? share.folderName : null,
-    folderName: share.folderName || null,
-    files: files.map(f => ({ path: f.path, size: f.file.size })),
-    hasText: !!text.trim()
-  };
-  try {
-    liveSender = await window.UniShareLive.startSender({
-      id: share.id,
-      files,
-      text,
-      listing,
-      onStatus: msg => { liveEl.textContent = msg; },
-      onReceiverJoin: () => { liveEl.textContent = 'Live: a receiver connected. Sending directly from this tab…'; },
-      onProgress: (path, done, total) => {
-        liveEl.textContent = `Live: sending ${path} — ${Math.round((done / total) * 100)}%`;
-      }
-    });
-  } catch (err) {
-    // Live sharing is best-effort; the stored copy still works.
-    liveEl.textContent = 'Live sharing unavailable. The stored copy is still available from the link.';
-  }
-}
-
-window.addEventListener('pagehide', () => {
-  try { if (liveSender) liveSender.close(); } catch {}
-});
 
 function copyLink(v) {
   if (!v) {

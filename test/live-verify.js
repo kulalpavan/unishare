@@ -1,36 +1,22 @@
 'use strict';
 
-/* Signaling-hub verification: runs without PostgreSQL by stubbing db.getShare.
+/* Signaling-hub verification for the pure-P2P server (no database).
  * Usage: node test/live-verify.js
  */
 
-process.env.DATABASE_URL = process.env.DATABASE_URL || 'postgres://unishare:unishare@127.0.0.1:1/unishare';
-
 const assert = require('node:assert');
-const bcrypt = require('bcryptjs');
+const crypto = require('node:crypto');
 const WebSocket = require('ws');
 
-const { server, db } = require('../server');
+const { server } = require('../server');
 
 const SHARE_ID = 'testshareid123456';
 const PASSWORD = 'hunter2';
 
+const sha256Hex = text => crypto.createHash('sha256').update(text).digest('hex');
+
 async function main() {
-  const hash = await bcrypt.hash(PASSWORD, 4);
-  db.getShare = async id => {
-    if (id === SHARE_ID) {
-      return {
-        id: SHARE_ID,
-        password_hash: hash,
-        expires_at: null,
-        created_at: Date.now()
-      };
-    }
-    if (id === 'openshare12345678') {
-      return { id, password_hash: null, expires_at: null, created_at: Date.now() };
-    }
-    return null;
-  };
+  const passwordHash = sha256Hex(PASSWORD);
 
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   const port = server.address().port;
@@ -46,39 +32,41 @@ async function main() {
     ws.once('message', raw => resolve(JSON.parse(raw.toString())));
   });
 
-  // 1. Sender registers.
+  // 1. Sender registers with listing + password hash + expiry.
   const sender = await connect();
   sender.send(JSON.stringify({
     type: 'register-sender',
     id: SHARE_ID,
-    listing: { kind: 'files', files: [{ path: 'a.txt', size: 5 }] }
+    listing: { kind: 'files', files: [{ path: 'a.txt', size: 5 }], hasText: false },
+    passwordHash,
+    expiresAt: Date.now() + 60 * 60 * 1000
   }));
   const registered = await nextMessage(sender);
   assert.equal(registered.type, 'registered');
   assert.ok(Array.isArray(registered.iceServers) && registered.iceServers.length);
   console.log('ok - sender registers, ICE servers returned');
 
-  // 2. Receiver with wrong password is rejected.
+  // 2. Receiver with wrong password hash is rejected.
   const wrongPw = await connect();
-  wrongPw.send(JSON.stringify({ type: 'join', id: SHARE_ID, password: 'nope' }));
+  wrongPw.send(JSON.stringify({ type: 'join', id: SHARE_ID, passwordHash: sha256Hex('nope') }));
   const rejected = await nextMessage(wrongPw);
   assert.equal(rejected.type, 'error');
   assert.equal(rejected.code, 'wrong-password');
   wrongPw.close();
   console.log('ok - wrong password rejected');
 
-  // 3. Receiver with correct password joins; sender is notified.
+  // 3. Receiver with correct hash joins; sender is notified; listing flows.
   const receiver = await connect();
-  receiver.send(JSON.stringify({ type: 'join', id: SHARE_ID, password: PASSWORD }));
+  receiver.send(JSON.stringify({ type: 'join', id: SHARE_ID, passwordHash }));
   const joined = await nextMessage(receiver);
   assert.equal(joined.type, 'joined');
   assert.equal(joined.senderOnline, true);
-  assert.deepEqual(joined.listing, { kind: 'files', files: [{ path: 'a.txt', size: 5 }] });
+  assert.deepEqual(joined.listing, { kind: 'files', files: [{ path: 'a.txt', size: 5 }], hasText: false });
   const receiverJoined = await nextMessage(sender);
   assert.equal(receiverJoined.type, 'receiver-joined');
   const receiverId = receiverJoined.receiverId;
   assert.ok(receiverId);
-  console.log('ok - password-gated join, sender notified');
+  console.log('ok - password-hash join, sender notified, listing delivered');
 
   // 4. Signals relay both ways.
   receiver.send(JSON.stringify({ type: 'signal', data: { sdp: { type: 'offer', sdp: 'v=0 fake' } } }));
@@ -91,30 +79,58 @@ async function main() {
   assert.equal(toReceiver.data.candidate.candidate, 'fake');
   console.log('ok - signals relay sender <-> receiver');
 
-  // 5. Unknown share is rejected.
+  // 5. transfer-complete notifies the sender.
+  receiver.send(JSON.stringify({ type: 'transfer-complete' }));
+  const complete = await nextMessage(sender);
+  assert.equal(complete.type, 'transfer-complete');
+  assert.equal(complete.receiverId, receiverId);
+  console.log('ok - transfer-complete reaches the sender');
+
+  // 6. Unknown share is rejected.
   const stranger = await connect();
-  stranger.send(JSON.stringify({ type: 'join', id: 'doesnotexist12345', password: '' }));
+  stranger.send(JSON.stringify({ type: 'join', id: 'doesnotexist12345', passwordHash: null }));
   const notFound = await nextMessage(stranger);
   assert.equal(notFound.type, 'error');
   assert.equal(notFound.code, 'share-not-found');
   stranger.close();
   console.log('ok - unknown share rejected');
 
-  // 6. Sender disconnect notifies the receiver.
+  // 7. Expired rooms are rejected.
+  const expSender = await connect();
+  expSender.send(JSON.stringify({
+    type: 'register-sender',
+    id: 'expiredshare123456',
+    listing: { kind: 'note', files: [], hasText: true },
+    passwordHash: null,
+    expiresAt: Date.now() + 50
+  }));
+  const expRegistered = await nextMessage(expSender);
+  assert.equal(expRegistered.type, 'registered');
+  await new Promise(r => setTimeout(r, 120));
+  const late = await connect();
+  late.send(JSON.stringify({ type: 'join', id: 'expiredshare123456', passwordHash: null }));
+  const expired = await nextMessage(late);
+  assert.equal(expired.type, 'error');
+  assert.equal(expired.code, 'share-not-found');
+  late.close();
+  expSender.close();
+  console.log('ok - expired rooms are gone');
+
+  // 8. Sender disconnect notifies the receiver.
   sender.close();
   const offline = await nextMessage(receiver);
   assert.equal(offline.type, 'sender-offline');
   receiver.close();
   console.log('ok - sender disconnect notifies receivers');
 
-  // 7. Open (passwordless) share join works when sender is offline.
-  const late = await connect();
-  late.send(JSON.stringify({ type: 'join', id: 'openshare12345678', password: '' }));
-  const lateJoined = await nextMessage(late);
-  assert.equal(lateJoined.type, 'joined');
-  assert.equal(lateJoined.senderOnline, false);
-  late.close();
-  console.log('ok - offline sender reported for open share');
+  // 9. Joining after the sender left reports sender-offline / not found.
+  const ghost = await connect();
+  ghost.send(JSON.stringify({ type: 'join', id: SHARE_ID, passwordHash }));
+  const gone = await nextMessage(ghost);
+  assert.equal(gone.type, 'error');
+  assert.ok(['sender-offline', 'share-not-found'].includes(gone.code));
+  ghost.close();
+  console.log('ok - dead rooms are not joinable');
 
   server.close();
   console.log('live-verify: all checks passed');
