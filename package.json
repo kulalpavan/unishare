@@ -8,7 +8,8 @@
     "dev": "node --env-file-if-exists=.env --watch server.js",
     "verify:live": "node test/live-verify.js",
     "verify:chunk": "node test/chunk-verify.js",
-    "verify": "npm run verify:live && npm run verify:chunk"
+    "verify:reconnect": "node test/reconnect-verify.js",
+    "verify": "npm run verify:live && npm run verify:chunk && npm run verify:reconnect"
   },
   "engines": {
     "node": ">=22"

@@ -170,24 +170,65 @@
     const filesByPath = new Map(files.map(f => [f.path, f]));
     const peers = new Map(); // receiverId -> { pc, dc }
     const pendingSignals = new Map(); // receiverId -> [data] received before the peer existed
-    const socket = new WebSocket(wsUrl());
+    let socket = null;
     let iceServers = [{ urls: 'stun:stun.l.google.com:19302' }];
     let closed = false;
+    let everRegistered = false;
+    let reconnectTimer = null;
+    let reconnectAttempts = 0;
+    const MAX_RECONNECT_ATTEMPTS = 30;
 
     const setStatus = msg => { if (onStatus) onStatus(msg); };
 
-    socket.addEventListener('message', event => {
+    const sendSocket = obj => {
+      if (socket && socket.readyState === WebSocket.OPEN) {
+        try { socket.send(JSON.stringify(obj)); } catch {}
+      }
+    };
+
+    const register = () => sendSocket({
+      type: 'register-sender',
+      id,
+      listing,
+      passwordHash: passwordHash || null,
+      expiresAt: expiresAt || null
+    });
+
+    // A dropped signaling socket must not end the share: the sender's tab
+    // still holds the files, so reconnect and re-register the same id.
+    // In-progress direct transfers keep running on their data channels.
+    function connectSocket() {
+      socket = new WebSocket(wsUrl());
+      socket.addEventListener('message', onSocketMessage);
+      socket.addEventListener('open', () => {
+        reconnectAttempts = 0;
+        register();
+      }, { once: true });
+      socket.addEventListener('close', () => {
+        if (closed || !everRegistered) return;
+        if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+          setStatus('Live sharing ended. The share link no longer works.');
+          return;
+        }
+        reconnectAttempts++;
+        setStatus('Connection interrupted. Reconnecting… Keep this tab open.');
+        reconnectTimer = setTimeout(connectSocket, Math.min(1500 * reconnectAttempts, 10000));
+      });
+    }
+
+    function onSocketMessage(event) {
       let msg;
       try { msg = JSON.parse(event.data); } catch { return; }
       if (msg.type === 'registered') {
+        everRegistered = true;
         if (Array.isArray(msg.iceServers) && msg.iceServers.length) iceServers = msg.iceServers;
-        setStatus('Live: waiting for the receiver. Keep this tab open.');
+        if (peers.size === 0) setStatus('Live: waiting for the receiver. Keep this tab open.');
         return;
       }
       if (msg.type === 'receiver-joined') {
         const receiverId = msg.receiverId;
         const pc = makePeerConnection(iceServers, data => {
-          socket.send(JSON.stringify({ type: 'signal', to: receiverId, data }));
+          sendSocket({ type: 'signal', to: receiverId, data });
         }, dc => attachSenderChannel(dc, filesByPath, text, listing, onProgress, onFileSent));
         pc.onconnectionstatechange = () => {
           if (pc.connectionState === 'failed') {
@@ -202,7 +243,7 @@
           pendingSignals.delete(receiverId);
           for (const data of queued) {
             handleSignalMessage(pc, data, sigData => {
-              socket.send(JSON.stringify({ type: 'signal', to: receiverId, data: sigData }));
+              sendSocket({ type: 'signal', to: receiverId, data: sigData });
             });
           }
         }
@@ -226,7 +267,7 @@
         const peer = peers.get(msg.from);
         if (peer) {
           handleSignalMessage(peer.pc, msg.data, data => {
-            socket.send(JSON.stringify({ type: 'signal', to: msg.from, data }));
+            sendSocket({ type: 'signal', to: msg.from, data });
           });
         } else {
           // The offer can beat the receiver-joined event: hold it until
@@ -238,28 +279,21 @@
         return;
       }
       if (msg.type === 'error') setStatus(`Live sharing unavailable: ${msg.code || 'error'}`);
-    });
+    }
 
-    socket.addEventListener('close', () => {
-      if (!closed) setStatus('Live sharing ended. The share link no longer works.');
-    });
+    connectSocket();
 
+    // The open handler registers this tab; wait for the first connection
+    // so the caller knows the share is live (reconnects re-register).
     await new Promise((resolve, reject) => {
       socket.addEventListener('open', resolve, { once: true });
       socket.addEventListener('error', reject, { once: true });
     });
 
-    socket.send(JSON.stringify({
-      type: 'register-sender',
-      id,
-      listing,
-      passwordHash: passwordHash || null,
-      expiresAt: expiresAt || null
-    }));
-
     return {
       close() {
         closed = true;
+        clearTimeout(reconnectTimer);
         for (const peer of peers.values()) { try { peer.pc.close(); } catch {} }
         peers.clear();
         try { socket.close(); } catch {}
@@ -274,36 +308,54 @@
       onFileProgress, onFileComplete, onDone, onError
     } = opts;
 
-    const socket = new WebSocket(wsUrl());
+    let socket = null;
     let pc = null;
     let dc = null;
     let iceServers = [{ urls: 'stun:stun.l.google.com:19302' }];
     let settled = false;
     let currentFile = null; // { path, size, chunks, received }
+    let joinTimer = null;
+    let reconnectTimer = null;
+    let joinAttempts = 0;
+    const MAX_JOIN_ATTEMPTS = 4;
     const pendingRequests = [];
 
+    const dcOpen = () => !!(dc && dc.readyState === 'open');
+
+    const sendSocket = obj => {
+      if (socket && socket.readyState === WebSocket.OPEN) {
+        try { socket.send(JSON.stringify(obj)); } catch {}
+      }
+    };
+
     const flushRequests = () => {
-      if (!dc || dc.readyState !== 'open') return;
+      if (!dcOpen()) return;
       while (pendingRequests.length) dc.send(pendingRequests.shift());
     };
 
     const queueRequest = obj => {
       const payload = JSON.stringify(obj);
-      if (dc && dc.readyState === 'open') dc.send(payload);
+      if (dcOpen()) dc.send(payload);
       else pendingRequests.push(payload);
     };
 
     const fail = err => {
       if (settled) return;
       settled = true;
+      clearTimeout(joinTimer);
+      clearTimeout(connectWatchdog);
+      clearTimeout(reconnectTimer);
       try { socket.close(); } catch {}
       if (pc) { try { pc.close(); } catch {} }
       if (onError) onError(err);
     };
 
-    const joinTimer = setTimeout(() => {
-      fail(new Error('sender-offline'));
-    }, timeoutMs || 8000);
+    const armJoinTimer = () => {
+      clearTimeout(joinTimer);
+      joinTimer = setTimeout(() => {
+        fail(new Error('sender-offline'));
+      }, timeoutMs || 8000);
+    };
 
     // If the direct connection never establishes, say so instead of
     // leaving the page blank forever.
@@ -311,15 +363,45 @@
     const armConnectWatchdog = () => {
       clearTimeout(connectWatchdog);
       connectWatchdog = setTimeout(() => {
-        if (!dc || dc.readyState !== 'open') fail(new Error('connection-failed'));
+        if (!dcOpen()) fail(new Error('connection-failed'));
       }, 20000);
     };
 
-    socket.addEventListener('message', event => {
+    // A signaling drop before the data channel opens is retried: the
+    // sender may have reconnected under the same id. Once the data
+    // channel is open, signaling is no longer needed and its loss is
+    // ignored so an in-progress transfer is never killed by it.
+    function connectSocket() {
+      socket = new WebSocket(wsUrl());
+      socket.addEventListener('message', onSocketMessage);
+      socket.addEventListener('open', () => {
+        armJoinTimer();
+        sendSocket({ type: 'join', id, passwordHash: passwordHash || null });
+      }, { once: true });
+      socket.addEventListener('close', () => {
+        if (settled) return;
+        if (dcOpen()) {
+          if (onStatus) onStatus('Signaling connection lost — the direct transfer continues.');
+          return;
+        }
+        clearTimeout(joinTimer);
+        if (pc) { try { pc.close(); } catch {} pc = null; dc = null; }
+        if (joinAttempts >= MAX_JOIN_ATTEMPTS) {
+          fail(new Error('sender-offline'));
+          return;
+        }
+        joinAttempts++;
+        if (onStatus) onStatus('Connection interrupted. Retrying…');
+        reconnectTimer = setTimeout(connectSocket, 1500);
+      });
+    }
+
+    function onSocketMessage(event) {
       let msg;
       try { msg = JSON.parse(event.data); } catch { return; }
 
       if (msg.type === 'error') {
+        if (dcOpen()) return;
         clearTimeout(joinTimer);
         fail(new Error(msg.code || 'error'));
         return;
@@ -327,6 +409,7 @@
 
       if (msg.type === 'joined') {
         clearTimeout(joinTimer);
+        joinAttempts = 0;
         if (Array.isArray(msg.iceServers) && msg.iceServers.length) iceServers = msg.iceServers;
         if (!msg.senderOnline) {
           fail(new Error('sender-offline'));
@@ -335,10 +418,11 @@
         if (onStatus) onStatus('Live sender found. Connecting directly…');
         if (onJoin && msg.listing) onJoin(msg.listing);
         pc = makePeerConnection(iceServers, data => {
-          socket.send(JSON.stringify({ type: 'signal', data }));
+          sendSocket({ type: 'signal', data });
         });
+        const thisPc = pc;
         pc.onconnectionstatechange = () => {
-          if (pc.connectionState === 'failed') fail(new Error('connection-failed'));
+          if (thisPc.connectionState === 'failed') fail(new Error('connection-failed'));
         };
         dc = pc.createDataChannel('unishare');
         dc.binaryType = 'arraybuffer';
@@ -350,14 +434,18 @@
         };
         dc.onmessage = handleChannelMessage;
         armConnectWatchdog();
-        pc.createOffer()
-          .then(offer => pc.setLocalDescription(offer))
-          .then(() => socket.send(JSON.stringify({ type: 'signal', data: { sdp: pc.localDescription } })))
-          .catch(err => fail(err));
+        thisPc.createOffer()
+          .then(offer => thisPc.setLocalDescription(offer))
+          .then(() => {
+            if (settled || pc !== thisPc) return; // abandoned by a reconnect
+            sendSocket({ type: 'signal', data: { sdp: thisPc.localDescription } });
+          })
+          .catch(err => { if (!settled && pc === thisPc) fail(err); });
         return;
       }
 
       if (msg.type === 'sender-offline') {
+        if (dcOpen()) return;
         fail(new Error('sender-offline'));
         return;
       }
@@ -366,13 +454,7 @@
         handleSignalMessage(pc, msg.data, () => {});
         return;
       }
-    });
-
-    socket.addEventListener('close', () => {
-      if (!settled && pc && pc.connectionState !== 'closed') {
-        fail(new Error('sender-offline'));
-      }
-    });
+    }
 
     let jsonParts = null; // reassembly buffer for chunked JSON messages
 
@@ -417,26 +499,35 @@
       }
     }
 
+    connectSocket();
+
+    // The open handler sends the join; wait for the first connection so
+    // the caller knows the join is underway (retries re-join).
     await new Promise((resolve, reject) => {
       socket.addEventListener('open', resolve, { once: true });
       socket.addEventListener('error', reject, { once: true });
     });
-    socket.send(JSON.stringify({ type: 'join', id, passwordHash: passwordHash || null }));
 
     return {
       requestText() { queueRequest({ t: 'get-text' }); },
       requestFile(path) { queueRequest({ t: 'get-file', path }); },
       notifyDownloaded() {
-        try { socket.send(JSON.stringify({ type: 'transfer-complete' })); } catch {}
+        sendSocket({ type: 'transfer-complete' });
       },
       finish() {
         settled = true;
+        clearTimeout(joinTimer);
+        clearTimeout(connectWatchdog);
+        clearTimeout(reconnectTimer);
         if (onDone) onDone();
         try { socket.close(); } catch {}
         if (pc) { try { pc.close(); } catch {} }
       },
       close() {
         settled = true;
+        clearTimeout(joinTimer);
+        clearTimeout(connectWatchdog);
+        clearTimeout(reconnectTimer);
         try { socket.close(); } catch {}
         if (pc) { try { pc.close(); } catch {} }
       }

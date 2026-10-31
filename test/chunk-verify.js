@@ -115,6 +115,7 @@ const sandbox = {
 };
 sandbox.window = sandbox;
 sandbox.globalThis = sandbox;
+sandbox.WebSocket.OPEN = 1;
 vm.createContext(sandbox);
 vm.runInContext(fs.readFileSync(path.join(__dirname, '..', 'public', 'p2p.js'), 'utf8'), sandbox);
 

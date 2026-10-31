@@ -140,7 +140,7 @@ function updateTabWarning() {
   const warn = $('tabWarning');
   if (!liveSender || liveDone) { warn.hidden = true; return; }
   warn.hidden = false;
-  warn.textContent = '⚠ Don\'t close this tab until the receiver has downloaded. The files live only in this tab — closing it ends the share.';
+  warn.textContent = '⚠ Don\'t close this tab until the receiver has downloaded. Keep it open and in the foreground — the files live only in this tab, and closing or backgrounding it ends the share.';
 }
 
 window.addEventListener('beforeunload', e => {
