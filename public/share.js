@@ -45,6 +45,7 @@ async function connectShare() {
   }
   try { if (liveReceiver) liveReceiver.close(); } catch {}
   liveReceiver = null;
+  listing = null;
   transferNotified = false;
   $('errCard').hidden = true;
   $('pwCard').hidden = true;
@@ -57,6 +58,16 @@ async function connectShare() {
       passwordHash,
       timeoutMs: 8000,
       onStatus: msg => setLiveStatus(msg),
+      onJoin: serverListing => {
+        // Show the listing as soon as the sender is found, from the
+        // manifest the server already holds — don't wait for the direct
+        // data channel before showing the user what was shared.
+        if (!listing) {
+          listing = serverListing;
+          renderListing(listing);
+        }
+        setLiveStatus('Live sender found. Connecting directly…');
+      },
       onManifest: msg => {
         listing = msg.listing || { kind: 'files', files: [], hasText: !!msg.hasText };
         renderListing(listing);
@@ -97,6 +108,12 @@ async function connectShare() {
           return showError(
             'Sender is offline',
             'This link only works while the sender keeps the tab open. Ask them to create the link again.'
+          );
+        }
+        if (code === 'connection-failed') {
+          return showError(
+            'Direct connection failed',
+            'The sender was found, but the browsers could not connect directly — usually a restrictive network or firewall. Ask the sender to keep the tab open and try again, ideally on the same Wi-Fi.'
           );
         }
         return showError('Something went wrong', 'Could not reach the sender. Try reloading the page.');

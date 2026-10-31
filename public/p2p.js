@@ -67,18 +67,38 @@
     dc.send(JSON.stringify({ t: 'file-end', path }));
   }
 
+  // ICE candidates that arrive before the remote description is set are
+  // rejected by the browser (InvalidStateError) — and in a fast loopback
+  // exchange that is usually the FIRST (host) candidate, i.e. exactly the
+  // one that makes same-network transfers work. Buffer them per connection
+  // and flush once the remote description lands.
+  function flushPendingCandidates(pc) {
+    const pending = pc._pendingCandidates;
+    if (!pending || !pending.length) return;
+    pc._pendingCandidates = [];
+    for (const c of pending) {
+      pc.addIceCandidate(new RTCIceCandidate(c)).catch(() => {});
+    }
+  }
+
   function handleSignalMessage(pc, data, sendSignal) {
     if (data.sdp) {
       return pc.setRemoteDescription(new RTCSessionDescription(data.sdp))
         .then(() => {
+          flushPendingCandidates(pc);
           if (data.sdp.type === 'offer') {
             return pc.createAnswer().then(answer => pc.setLocalDescription(answer))
               .then(() => sendSignal({ sdp: pc.localDescription }));
           }
           return null;
-        });
+        })
+        .catch(err => console.error('[p2p] signal failed:', err.message));
     }
     if (data.candidate) {
+      if (!pc.remoteDescription) {
+        (pc._pendingCandidates || (pc._pendingCandidates = [])).push(data.candidate);
+        return Promise.resolve();
+      }
       return pc.addIceCandidate(new RTCIceCandidate(data.candidate)).catch(() => {});
     }
     return Promise.resolve();
@@ -131,6 +151,7 @@
     } = opts;
     const filesByPath = new Map(files.map(f => [f.path, f]));
     const peers = new Map(); // receiverId -> { pc, dc }
+    const pendingSignals = new Map(); // receiverId -> [data] received before the peer existed
     const socket = new WebSocket(wsUrl());
     let iceServers = [{ urls: 'stun:stun.l.google.com:19302' }];
     let closed = false;
@@ -150,7 +171,23 @@
         const pc = makePeerConnection(iceServers, data => {
           socket.send(JSON.stringify({ type: 'signal', to: receiverId, data }));
         }, dc => attachSenderChannel(dc, filesByPath, text, listing, onProgress, onFileSent));
+        pc.onconnectionstatechange = () => {
+          if (pc.connectionState === 'failed') {
+            try { pc.close(); } catch {}
+            peers.delete(receiverId);
+          }
+        };
         peers.set(receiverId, { pc, dc: null });
+        // Replay any signals that arrived before this peer existed.
+        const queued = pendingSignals.get(receiverId);
+        if (queued) {
+          pendingSignals.delete(receiverId);
+          for (const data of queued) {
+            handleSignalMessage(pc, data, sigData => {
+              socket.send(JSON.stringify({ type: 'signal', to: receiverId, data: sigData }));
+            });
+          }
+        }
         if (onReceiverJoin) onReceiverJoin(receiverId);
         setStatus('Receiver connected. Sending directly from this tab…');
         return;
@@ -173,6 +210,12 @@
           handleSignalMessage(peer.pc, msg.data, data => {
             socket.send(JSON.stringify({ type: 'signal', to: msg.from, data }));
           });
+        } else {
+          // The offer can beat the receiver-joined event: hold it until
+          // the peer connection exists instead of dropping it.
+          const queued = pendingSignals.get(msg.from) || [];
+          queued.push(msg.data);
+          pendingSignals.set(msg.from, queued);
         }
         return;
       }
@@ -209,7 +252,7 @@
   /* Receiver side: connect to the sender's tab and pull files over WebRTC. */
   async function startReceiver(opts) {
     const {
-      id, passwordHash, timeoutMs, onStatus, onManifest, onText, onFileStart,
+      id, passwordHash, timeoutMs, onStatus, onJoin, onManifest, onText, onFileStart,
       onFileProgress, onFileComplete, onDone, onError
     } = opts;
 
@@ -244,6 +287,16 @@
       fail(new Error('sender-offline'));
     }, timeoutMs || 8000);
 
+    // If the direct connection never establishes, say so instead of
+    // leaving the page blank forever.
+    let connectWatchdog = null;
+    const armConnectWatchdog = () => {
+      clearTimeout(connectWatchdog);
+      connectWatchdog = setTimeout(() => {
+        if (!dc || dc.readyState !== 'open') fail(new Error('connection-failed'));
+      }, 20000);
+    };
+
     socket.addEventListener('message', event => {
       let msg;
       try { msg = JSON.parse(event.data); } catch { return; }
@@ -262,17 +315,23 @@
           return;
         }
         if (onStatus) onStatus('Live sender found. Connecting directly…');
+        if (onJoin && msg.listing) onJoin(msg.listing);
         pc = makePeerConnection(iceServers, data => {
           socket.send(JSON.stringify({ type: 'signal', data }));
         });
+        pc.onconnectionstatechange = () => {
+          if (pc.connectionState === 'failed') fail(new Error('connection-failed'));
+        };
         dc = pc.createDataChannel('unishare');
         dc.binaryType = 'arraybuffer';
         dc.onopen = () => {
+          clearTimeout(connectWatchdog);
           if (onStatus) onStatus('Connected directly to the sender.');
           dc.send(JSON.stringify({ t: 'get-manifest' }));
           flushRequests();
         };
         dc.onmessage = handleChannelMessage;
+        armConnectWatchdog();
         pc.createOffer()
           .then(offer => pc.setLocalDescription(offer))
           .then(() => socket.send(JSON.stringify({ type: 'signal', data: { sdp: pc.localDescription } })))
