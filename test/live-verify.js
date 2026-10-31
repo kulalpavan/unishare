@@ -132,6 +132,26 @@ async function main() {
   ghost.close();
   console.log('ok - dead rooms are not joinable');
 
+  // 10. An oversized message closes only that socket (1009) and never
+  // crashes the server: a fresh client must still be able to register.
+  const abusive = await connect();
+  const abusiveClosed = new Promise(resolve => abusive.once('close', (code) => resolve(code)));
+  abusive.send(Buffer.alloc(5 * 1024 * 1024, 0x61)); // 5MB > 4MB cap
+  const closeCode = await abusiveClosed;
+  assert.equal(closeCode, 1009);
+  const survivor = await connect();
+  survivor.send(JSON.stringify({
+    type: 'register-sender',
+    id: 'survivorroom12345',
+    listing: { kind: 'note', files: [], hasText: true },
+    passwordHash: null,
+    expiresAt: null
+  }));
+  const survivorRegistered = await nextMessage(survivor);
+  assert.equal(survivorRegistered.type, 'registered');
+  survivor.close();
+  console.log('ok - oversized message kills only its own socket, server survives');
+
   server.close();
   console.log('live-verify: all checks passed');
 }

@@ -23,7 +23,9 @@ const { WebSocketServer } = require('ws');
 const PORT = Number(process.env.PORT || 3000);
 const ID_RE = /^[A-Za-z0-9_-]{8,64}$/;
 const HASH_RE = /^[0-9a-f]{64}$/;
-const MAX_SIGNAL_BYTES = 256 * 1024;
+// Large enough for very big folder listings (thousands of files) sent in
+// register-sender; still bounded so one client can't OOM the server.
+const MAX_SIGNAL_BYTES = 4 * 1024 * 1024;
 const ROOM_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
 const app = express();
@@ -89,6 +91,11 @@ const liveRooms = new Map(); // shareId -> { sender, receivers, listing, passwor
 
 const wss = new WebSocketServer({ server, path: '/live', maxPayload: MAX_SIGNAL_BYTES });
 
+// A socket with no 'error' listener turns any protocol error (e.g. a message
+// over maxPayload -> 1009) into an uncaught exception that kills the whole
+// process. Never let one bad client take the server down.
+wss.on('error', err => console.error('[live] hub error:', err.message));
+
 function liveSend(ws, obj) {
   if (ws.readyState === ws.OPEN) {
     try { ws.send(JSON.stringify(obj)); } catch {}
@@ -133,6 +140,10 @@ wss.on('connection', ws => {
   ws._roomId = null;
   ws._alive = true;
   ws.on('pong', () => { ws._alive = true; });
+  ws.on('error', err => {
+    console.error('[live] socket error:', err.message);
+    try { ws.close(); } catch {}
+  });
 
   ws.on('message', async raw => {
     let msg;
