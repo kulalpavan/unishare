@@ -59,9 +59,11 @@ app.use((req, res, next) => {
 
 // ICE servers for WebRTC peer connections. Configure via ICE_SERVERS env var
 // (JSON array). Defaults to Google's free public STUN server plus the Open
-// Relay Project's free shared TURN servers: without TURN, two browsers
-// behind symmetric NATs (common on mobile networks) can never connect
-// directly. The Open Relay credentials below are the project's published
+// Relay Project's free shared TURN servers on every transport (UDP, TCP on
+// ports 80/443, and TLS on 443): without TURN, two browsers behind symmetric
+// NATs (common on mobile networks) can never connect directly, and without
+// the TCP/TLS variants, networks that block UDP can't relay at all.
+// The Open Relay credentials below are the project's published
 // shared demo credentials; heavy users should get their own free ones.
 function iceServers() {
   try {
@@ -71,7 +73,10 @@ function iceServers() {
   return [
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
-    { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' }
+    { urls: 'turn:openrelay.metered.ca:80?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
+    { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
+    { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
+    { urls: 'turns:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' }
   ];
 }
 

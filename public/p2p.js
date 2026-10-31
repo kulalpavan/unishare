@@ -41,10 +41,19 @@
   const MAX_CHAT_RECEIVE = 4000;
   // Fallback ICE servers if the hub returns none: STUN plus the Open Relay
   // Project's free shared TURN servers (same default as the server).
+  // Every transport is listed: plain UDP relay fails on networks that
+  // block UDP, so TCP on ports 80/443 and TLS (TURNS) on 443 are included
+  // as fallbacks — without them, restrictive Wi-Fi/firewalls can never
+  // connect at all.
+  const TURN_USERNAME = 'openrelayproject';
+  const TURN_CREDENTIAL = 'openrelayproject';
   const DEFAULT_ICE_SERVERS = [
     { urls: 'stun:stun.l.google.com:19302' },
-    { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
-    { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' }
+    { urls: 'turn:openrelay.metered.ca:80', username: TURN_USERNAME, credential: TURN_CREDENTIAL },
+    { urls: 'turn:openrelay.metered.ca:80?transport=tcp', username: TURN_USERNAME, credential: TURN_CREDENTIAL },
+    { urls: 'turn:openrelay.metered.ca:443', username: TURN_USERNAME, credential: TURN_CREDENTIAL },
+    { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: TURN_USERNAME, credential: TURN_CREDENTIAL },
+    { urls: 'turns:openrelay.metered.ca:443?transport=tcp', username: TURN_USERNAME, credential: TURN_CREDENTIAL }
   ];
 
   function sendJson(dc, obj) {
@@ -236,18 +245,65 @@
       expiresAt: expiresAt || null
     });
 
+    // Build (or rebuild) the peer connection for one receiver: used when a
+    // receiver joins, and again when a receiver restarts its connection
+    // after an ICE failure and re-offers.
+    function createPeerFor(receiverId) {
+      const label = `Receiver ${++receiverCount}`;
+      const pc = makePeerConnection(iceServers, data => {
+        sendSocket({ type: 'signal', to: receiverId, data });
+      }, dc => {
+        const peer = peers.get(receiverId);
+        if (peer) peer.dc = dc;
+        dc.onopen = () => { if (onConnect) { try { onConnect(receiverId, label); } catch {} } };
+        dc.onclose = () => {
+          const p = peers.get(receiverId);
+          if (p && p.dc === dc) p.dc = null;
+        };
+        attachSenderChannel(dc, filesByPath, text, listing, onProgress, onFileSent, onChat, label);
+      });
+      pc.onconnectionstatechange = () => {
+        if (pc.connectionState === 'failed') {
+          try { pc.close(); } catch {}
+          peers.delete(receiverId);
+          pendingSignals.delete(receiverId);
+        }
+      };
+      peers.set(receiverId, { pc, dc: null, label });
+      // Replay any signals that arrived before this peer existed.
+      const queued = pendingSignals.get(receiverId);
+      if (queued) {
+        pendingSignals.delete(receiverId);
+        for (const data of queued) {
+          handleSignalMessage(pc, data, sigData => {
+            sendSocket({ type: 'signal', to: receiverId, data: sigData });
+          });
+        }
+      }
+      return pc;
+    }
+
     // A dropped signaling socket must not end the share: the sender's tab
     // still holds the files, so reconnect and re-register the same id.
     // In-progress direct transfers keep running on their data channels.
     function connectSocket() {
+      reconnectTimer = null;
       socket = new WebSocket(wsUrl());
+      const thisSocket = socket;
       socket.addEventListener('message', onSocketMessage);
       socket.addEventListener('open', () => {
+        if (socket !== thisSocket) return; // superseded socket
         reconnectAttempts = 0;
         register();
       }, { once: true });
       socket.addEventListener('close', () => {
+        // Only the current socket may trigger a reconnect. A close from
+        // a superseded socket must not schedule another reconnect or the
+        // tab ends up with duplicate sockets and repeated "interrupted"
+        // notices while the transfer itself is fine.
+        if (socket !== thisSocket) return;
         if (closed || expired || !everRegistered) return;
+        if (reconnectTimer) return; // a reconnect is already scheduled
         if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
           setStatus('Live sharing ended. The share link no longer works.');
           return;
@@ -264,7 +320,10 @@
       if (msg.type === 'registered') {
         everRegistered = true;
         if (Array.isArray(msg.iceServers) && msg.iceServers.length) iceServers = msg.iceServers;
-        if (peers.size === 0) setStatus('Live: waiting for the receiver. Keep this tab open.');
+        // After a mid-share reconnect the "interrupted" notice must not
+        // stick: with a receiver already connected, say so explicitly.
+        if (peers.size > 0) setStatus('Reconnected. The receiver is still connected — sharing continues.');
+        else setStatus('Live: waiting for the receiver. Keep this tab open.');
         return;
       }
       if (msg.type === 'expired') {
@@ -277,37 +336,9 @@
       }
       if (msg.type === 'receiver-joined') {
         const receiverId = msg.receiverId;
-        const label = `Receiver ${++receiverCount}`;
-        const pc = makePeerConnection(iceServers, data => {
-          sendSocket({ type: 'signal', to: receiverId, data });
-        }, dc => {
-          const peer = peers.get(receiverId);
-          if (peer) peer.dc = dc;
-          dc.onopen = () => { if (onConnect) { try { onConnect(receiverId, label); } catch {} } };
-          dc.onclose = () => {
-            const p = peers.get(receiverId);
-            if (p && p.dc === dc) p.dc = null;
-          };
-          attachSenderChannel(dc, filesByPath, text, listing, onProgress, onFileSent, onChat, label);
-        });
-        pc.onconnectionstatechange = () => {
-          if (pc.connectionState === 'failed') {
-            try { pc.close(); } catch {}
-            peers.delete(receiverId);
-            pendingSignals.delete(receiverId);
-          }
-        };
-        peers.set(receiverId, { pc, dc: null, label });
-        // Replay any signals that arrived before this peer existed.
-        const queued = pendingSignals.get(receiverId);
-        if (queued) {
-          pendingSignals.delete(receiverId);
-          for (const data of queued) {
-            handleSignalMessage(pc, data, sigData => {
-              sendSocket({ type: 'signal', to: receiverId, data: sigData });
-            });
-          }
-        }
+        const old = peers.get(receiverId);
+        if (old) { try { old.pc.close(); } catch {} peers.delete(receiverId); }
+        createPeerFor(receiverId);
         if (onReceiverJoin) onReceiverJoin(receiverId);
         setStatus('Receiver connected. Sending directly from this tab…');
         return;
@@ -326,7 +357,16 @@
         return;
       }
       if (msg.type === 'signal' && msg.from) {
-        const peer = peers.get(msg.from);
+        let peer = peers.get(msg.from);
+        if (!peer && msg.data && msg.data.sdp && msg.data.sdp.type === 'offer') {
+          // The receiver restarted its peer connection after an ICE
+          // failure: the old peer is gone, so build a fresh one for this
+          // re-offer instead of dropping the handshake. Queued signals
+          // for the dead peer are stale — drop them.
+          pendingSignals.delete(msg.from);
+          createPeerFor(msg.from);
+          peer = peers.get(msg.from);
+        }
         if (peer) {
           handleSignalMessage(peer.pc, msg.data, data => {
             sendSocket({ type: 'signal', to: msg.from, data });
@@ -394,6 +434,8 @@
     let reconnectTimer = null;
     let joinAttempts = 0;
     const MAX_JOIN_ATTEMPTS = 4;
+    let peerAttempts = 0;
+    const MAX_PEER_ATTEMPTS = 2;
     const pendingRequests = [];
 
     const dcOpen = () => !!(dc && dc.readyState === 'open');
@@ -439,7 +481,15 @@
     const armConnectWatchdog = () => {
       clearTimeout(connectWatchdog);
       connectWatchdog = setTimeout(() => {
-        if (!dcOpen()) fail(new Error('connection-failed'));
+        if (dcOpen() || settled) return;
+        // Slow ICE (e.g. TURN allocation on a bad network) gets one
+        // retry with a fresh connection instead of an instant failure.
+        if (peerAttempts < MAX_PEER_ATTEMPTS) {
+          if (onStatus) onStatus('Direct connection is taking a while. Retrying…');
+          startPeerConnection();
+        } else {
+          fail(new Error('connection-failed'));
+        }
       }, 20000);
     };
 
@@ -448,18 +498,23 @@
     // channel is open, signaling is no longer needed and its loss is
     // ignored so an in-progress transfer is never killed by it.
     function connectSocket() {
+      reconnectTimer = null;
       socket = new WebSocket(wsUrl());
+      const thisSocket = socket;
       socket.addEventListener('message', onSocketMessage);
       socket.addEventListener('open', () => {
+        if (socket !== thisSocket) return; // superseded socket
         armJoinTimer();
         sendSocket({ type: 'join', id, passwordHash: passwordHash || null });
       }, { once: true });
       socket.addEventListener('close', () => {
+        if (socket !== thisSocket) return; // superseded socket
         if (settled) return;
         if (dcOpen()) {
           if (onStatus) onStatus('Signaling connection lost — the direct transfer continues.');
           return;
         }
+        if (reconnectTimer) return; // a retry is already scheduled
         clearTimeout(joinTimer);
         if (pc) { try { pc.close(); } catch {} pc = null; dc = null; }
         if (joinAttempts >= MAX_JOIN_ATTEMPTS) {
@@ -470,6 +525,52 @@
         if (onStatus) onStatus('Connection interrupted. Retrying…');
         reconnectTimer = setTimeout(connectSocket, 1500);
       });
+    }
+
+    // (Re)build the peer connection and offer. A failed ICE attempt is
+    // retried once with a fresh connection before giving up: TURN
+    // allocation and NAT mapping can fail transiently, and a single
+    // attempt makes the share look broken when a retry would connect.
+    function startPeerConnection() {
+      if (pc) { try { pc.close(); } catch {} }
+      pc = null;
+      dc = null;
+      peerAttempts++;
+      pc = makePeerConnection(iceServers, data => {
+        sendSocket({ type: 'signal', data });
+      });
+      const thisPc = pc;
+      pc.onconnectionstatechange = () => {
+        if (thisPc.connectionState !== 'failed') return;
+        if (settled || pc !== thisPc) return;
+        if (peerAttempts < MAX_PEER_ATTEMPTS) {
+          if (onStatus) onStatus('Direct connection failed. Retrying…');
+          startPeerConnection();
+        } else {
+          fail(new Error('connection-failed'));
+        }
+      };
+      dc = pc.createDataChannel('unishare');
+      dc.binaryType = 'arraybuffer';
+      dc.onopen = () => {
+        clearTimeout(connectWatchdog);
+        // A working connection refreshes the retry budget, so a later
+        // failure gets a fresh retry instead of failing outright.
+        peerAttempts = 0;
+        if (onStatus) onStatus('Connected directly to the sender.');
+        if (onConnect) { try { onConnect(); } catch {} }
+        dc.send(JSON.stringify({ t: 'get-manifest' }));
+        flushRequests();
+      };
+      dc.onmessage = handleChannelMessage;
+      armConnectWatchdog();
+      thisPc.createOffer()
+        .then(offer => thisPc.setLocalDescription(offer))
+        .then(() => {
+          if (settled || pc !== thisPc) return; // abandoned by a reconnect
+          sendSocket({ type: 'signal', data: { sdp: thisPc.localDescription } });
+        })
+        .catch(err => { if (!settled && pc === thisPc) fail(err); });
     }
 
     function onSocketMessage(event) {
@@ -493,31 +594,8 @@
         }
         if (onStatus) onStatus('Live sender found. Connecting directly…');
         if (onJoin && msg.listing) onJoin(msg.listing);
-        pc = makePeerConnection(iceServers, data => {
-          sendSocket({ type: 'signal', data });
-        });
-        const thisPc = pc;
-        pc.onconnectionstatechange = () => {
-          if (thisPc.connectionState === 'failed') fail(new Error('connection-failed'));
-        };
-        dc = pc.createDataChannel('unishare');
-        dc.binaryType = 'arraybuffer';
-        dc.onopen = () => {
-          clearTimeout(connectWatchdog);
-          if (onStatus) onStatus('Connected directly to the sender.');
-          if (onConnect) { try { onConnect(); } catch {} }
-          dc.send(JSON.stringify({ t: 'get-manifest' }));
-          flushRequests();
-        };
-        dc.onmessage = handleChannelMessage;
-        armConnectWatchdog();
-        thisPc.createOffer()
-          .then(offer => thisPc.setLocalDescription(offer))
-          .then(() => {
-            if (settled || pc !== thisPc) return; // abandoned by a reconnect
-            sendSocket({ type: 'signal', data: { sdp: thisPc.localDescription } });
-          })
-          .catch(err => { if (!settled && pc === thisPc) fail(err); });
+        peerAttempts = 0;
+        startPeerConnection();
         return;
       }
 

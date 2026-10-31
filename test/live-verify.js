@@ -220,6 +220,16 @@ async function main() {
   for (const s of roomSockets) s.close();
   console.log('ok - room count and listing memory are capped');
 
+  // 14. /api/ice advertises TURN on every transport (UDP, TCP, TLS), so
+  // restrictive networks that block UDP still get a relay path.
+  const iceRes = await fetch(`http://127.0.0.1:${port}/api/ice`);
+  const iceBody = await iceRes.json();
+  const urls = (iceBody.iceServers || []).map(s => s.urls);
+  assert.ok(urls.some(u => u.startsWith('turn:') && !u.includes('transport=')), 'UDP TURN present');
+  assert.ok(urls.some(u => u.includes('?transport=tcp') && u.startsWith('turn:')), 'TCP TURN present');
+  assert.ok(urls.some(u => u.startsWith('turns:')), 'TLS TURN present');
+  console.log('ok - ICE servers include UDP, TCP and TLS TURN');
+
   server.close();
   console.log('live-verify: all checks passed');
 }

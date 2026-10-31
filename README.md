@@ -50,7 +50,7 @@ Covers the signaling hub without any database: sender registration, password-has
 | `PORT` | `3000` | Port to listen on |
 | `ICE_SERVERS` | Google STUN | JSON array of WebRTC ICE servers (see below) |
 
-ICE servers are configured with the `ICE_SERVERS` env var (JSON array); the default is Google's free public STUN server plus the Open Relay Project's free shared TURN servers, so direct connections work behind symmetric NATs (common on mobile networks) too. The default TURN credentials are the project's published shared demo credentials — get your own free ones for heavy use. See `.env.example`.
+ICE servers are configured with the `ICE_SERVERS` env var (JSON array); the default is Google's free public STUN server plus the Open Relay Project's free shared TURN servers on every transport (UDP, TCP on ports 80/443, and TLS on 443), so direct connections work behind symmetric NATs (common on mobile networks) and on networks that block UDP too. If a direct connection fails once, the receiver automatically retries with a fresh connection before showing an error. The default TURN credentials are the project's published shared demo credentials — get your own free ones for heavy use. See `.env.example`.
 
 ## Deploy to Render
 

@@ -184,6 +184,63 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
   assert.equal(hub.registers, registersBefore, 'expired sender does not re-register');
   assert.equal(sockets.length, socketsBefore, 'expired sender opens no new socket');
   console.log('ok - expired share stops reconnecting, no resurrection');
+  // --- 5. Sender status recovers after a mid-share reconnect, and a
+  // stale socket close spawns nothing -------------------------------
+  const statuses = [];
+  await startSender({
+    id: 'status-room', files: [], text: 'hi', listing,
+    passwordHash: null, expiresAt: null,
+    onStatus: msg => statuses.push(msg),
+    onReceiverJoin: () => {}, onReceiverLeft: () => {},
+    onProgress: () => {}, onFileSent: () => {}, onTransferComplete: () => {}
+  });
+  const pcsBeforeJoin = pcs.length;
+  const probe2 = new sandbox.WebSocket();
+  await new Promise(r => probe2.addEventListener('open', r, { once: true }));
+  probe2.send(JSON.stringify({ type: 'join', id: 'status-room', passwordHash: null }));
+  await sleep(100);
+  assert.ok(pcs.length > pcsBeforeJoin, 'a peer connection was created for the join');
+  const senderSocketA = hub.rooms.get('status-room').sender;
+  senderSocketA.emit('close', {});
+  await sleep(2200);
+  assert.ok(
+    statuses[statuses.length - 1].includes('Reconnected'),
+    'status recovers after reconnect, got: ' + statuses.join(' | ')
+  );
+  // A second close event from the superseded socket must be ignored.
+  const socketsBeforeStale = sockets.length;
+  const registersBeforeStale = hub.registers;
+  senderSocketA.emit('close', {});
+  await sleep(2200);
+  assert.equal(sockets.length, socketsBeforeStale, 'stale socket close opens no new socket');
+  assert.equal(hub.registers, registersBeforeStale, 'stale socket close triggers no re-register');
+  console.log('ok - sender status recovers after reconnect; stale socket closes ignored');
+
+  // --- 6. A stale receiver socket close triggers no extra join --------
+  const receiver6Errors = [];
+  const receiver6 = await startReceiver({
+    id: 'status-room', passwordHash: null, timeoutMs: 8000,
+    onStatus: () => {},
+    onManifest: () => {}, onText: () => {},
+    onFileStart: () => {}, onFileProgress: () => {}, onFileComplete: () => {},
+    onDone: () => {}, onError: err => receiver6Errors.push(err)
+  });
+  await sleep(100);
+  const receiverSocketA = sockets[sockets.length - 1];
+  const joinsBeforeDrop = hub.joins;
+  receiverSocketA.emit('close', {});
+  await sleep(2200);
+  assert.ok(hub.joins > joinsBeforeDrop, 'receiver retried the join after the drop');
+  const joinsAfterRetry = hub.joins;
+  const socketsAfterRetry = sockets.length;
+  receiverSocketA.emit('close', {});
+  await sleep(2200);
+  assert.equal(hub.joins, joinsAfterRetry, 'stale socket close triggers no extra join');
+  assert.equal(sockets.length, socketsAfterRetry, 'stale socket close opens no new socket');
+  assert.equal(receiver6Errors.length, 0, 'no error from the stale close');
+  receiver6.close();
+  console.log('ok - stale receiver socket closes are ignored');
+
   console.log('reconnect-verify: all checks passed');
   process.exit(0);
 })().catch(err => { console.error('reconnect-verify FAILED:', err); process.exit(1); });

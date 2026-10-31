@@ -51,8 +51,10 @@ class FakePC {
 // In-memory hub mimicking server.js relay rules.
 const hub = {
   rooms: new Map(),
+  offers: 0,
   route(ws, raw) {
     const msg = JSON.parse(raw);
+    if (msg.type === 'signal' && msg.data && msg.data.sdp && msg.data.sdp.type === 'offer') this.offers++;
     if (msg.type === 'register-sender') {
       this.rooms.set(msg.id, { sender: ws, receivers: new Map(), listing: msg.listing });
       ws.emit('message', { data: JSON.stringify({ type: 'registered', iceServers: [] }) });
@@ -86,13 +88,17 @@ class FakePCWired extends FakePC {
   }
   async setRemoteDescription(d) {
     // Link the channels BEFORE the base implementation fires
-    // ondatachannel for an incoming offer.
-    if (d.type === 'offer' && pcs.length === 2 && pcs[0]._dc && !pcs[0]._dc.peer) {
-      const receiverDc = pcs[0]._dc;
-      const senderDc = new FakeDC();
-      receiverDc.peer = senderDc;
-      senderDc.peer = receiverDc;
-      this._peerDc = senderDc;
+    // ondatachannel for an incoming offer. A fresh peer (e.g. after an
+    // ICE retry) has no linked channel yet, so pair it with the newest
+    // unpaired data channel.
+    if (d.type === 'offer' && !this._peerDc) {
+      const other = [...pcs].reverse().find(p => p !== this && p._dc && !p._dc.peer);
+      if (other) {
+        const senderDc = new FakeDC();
+        other._dc.peer = senderDc;
+        senderDc.peer = other._dc;
+        this._peerDc = senderDc;
+      }
     }
     await super.setRemoteDescription(d);
   }
@@ -140,6 +146,7 @@ const { startSender, startReceiver } = sandbox.UniShareLive;
   });
 
   let gotManifest = null;
+  let manifestCount = 0;
   let gotText = null;
   let fileError = null;
   let sessionErrors = 0;
@@ -149,7 +156,7 @@ const { startSender, startReceiver } = sandbox.UniShareLive;
     startReceiver({
       id: 'big-room-test', passwordHash: null, timeoutMs: 5000,
       onStatus: () => {},
-      onManifest: msg => { gotManifest = msg; },
+      onManifest: msg => { gotManifest = msg; manifestCount++; },
       onText: text => { gotText = text; resolve(); },
       onFileStart: () => {}, onFileProgress: () => {}, onFileComplete: () => {},
       onFileError: (path, message) => { fileError = { path, message }; },
@@ -219,6 +226,36 @@ const { startSender, startReceiver } = sandbox.UniShareLive;
   assert.equal(senderChats.length, 2, 'oversized inbound chat dropped on the sender');
   assert.equal(sessionErrors, 0, 'chat traffic never fails the session');
   console.log('ok - ephemeral chat round-trips, truncates, and drops oversized messages');
+
+  // ICE failure retry: a failed peer connection is rebuilt once (fresh
+  // offer) instead of killing the session — first with the sender's
+  // peer still alive (re-negotiation), then with both peers dead (the
+  // sender builds a fresh peer for the re-offer).
+  const offersBefore = hub.offers;
+  pcs[0].connectionState = 'failed';
+  pcs[0].handlers.conn();
+  await new Promise(r => setTimeout(r, 100));
+  assert.equal(sessionErrors, 0, 'first ICE failure does not fail the session');
+  assert.ok(hub.offers > offersBefore, 'receiver re-offered after ICE failure');
+  // The rebuilt connection opens: the retry budget resets, so a later
+  // failure gets a fresh retry instead of failing outright.
+  pcs[2]._dc.onopen();
+  await new Promise(r => setTimeout(r, 50));
+  const senderPc = pcs[1];
+  senderPc.connectionState = 'failed';
+  senderPc.handlers.conn();
+  pcs[2].connectionState = 'failed';
+  pcs[2].handlers.conn();
+  await new Promise(r => setTimeout(r, 100));
+  assert.equal(sessionErrors, 0, 'ICE failure on both sides does not fail the session');
+  assert.ok(hub.offers >= offersBefore + 2, 're-offers sent after both-side failure');
+  const manifestsBefore = manifestCount;
+  const newestReceiverDc = [...pcs].reverse().find(p => p._dc && p._dc.peer)._dc;
+  assert.ok(newestReceiverDc, 'a linked receiver channel exists after retry');
+  newestReceiverDc.onopen();
+  await new Promise(r => setTimeout(r, 100));
+  assert.ok(manifestCount > manifestsBefore, 'manifest flows again over the rebuilt connection');
+  console.log('ok - ICE failure retried with a fresh connection, session survives');
   console.log('chunk-verify: all checks passed');
   process.exit(0);
 })().catch(err => { console.error('chunk-verify FAILED:', err); process.exit(1); });
