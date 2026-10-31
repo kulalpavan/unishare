@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Shared with UniShare</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div class="deco deco-a" aria-hidden="true"></div>
+  <div class="deco deco-b" aria-hidden="true"></div>
+  <div class="deco deco-c" aria-hidden="true"></div>
+
+  <header class="menubar">
+    <div class="menubar-left">
+      <a class="brand" href="/"><span class="mark">U</span>UNISHARE</a>
+      <span class="tag">SHARE VIEWER</span>
+    </div>
+    <div class="menubar-right">
+      <span class="tag" id="shareIdTag"></span>
+      <span class="clock" id="clock">--:--</span>
+      <span class="status-dot" title="Online"></span>
+    </div>
+  </header>
+
+  <main class="workspace">
+    <section class="window" id="pwCard" hidden aria-labelledby="pwTitle">
+      <div class="titlebar pink">
+        <div class="win-title" id="pwTitle"><span class="chip">02</span>LOCK.SYS — PASSWORD REQUIRED</div>
+        <div class="win-controls" aria-hidden="true"><span></span><span></span><span></span></div>
+      </div>
+      <div class="window-body">
+        <h2 class="win-h2">Locked share</h2>
+        <form id="pwForm">
+          <label class="opt">
+            <span>Password</span>
+            <input type="password" id="pwInput" autocomplete="current-password" autofocus>
+          </label>
+          <button class="btn primary big" type="submit">⚿ Unlock share</button>
+          <p class="status err" id="pwStatus" role="status"></p>
+        </form>
+      </div>
+    </section>
+
+    <section class="window" id="shareCard" hidden aria-labelledby="shareTitle">
+      <div class="titlebar">
+        <div class="win-title"><span class="chip">03</span>EXPLORER.EXE — SHARED CONTENT</div>
+        <div class="win-controls" aria-hidden="true"><span></span><span></span><span></span></div>
+      </div>
+      <div class="window-body">
+        <div class="share-head">
+          <h2 id="shareTitle"></h2>
+          <p class="tagline" id="shareTagline">Read-only · one link</p>
+        </div>
+        <p class="meta" id="shareMeta"></p>
+
+        <div class="block" id="textBlock" hidden>
+          <h3>NOTE.TXT</h3>
+          <pre class="note" id="textContent"></pre>
+        </div>
+
+        <div class="block" id="filesBlock" hidden>
+          <h3 id="filesHeading">FILES</h3>
+          <table class="filelist" id="fileTable">
+            <tbody id="fileRows"></tbody>
+          </table>
+        </div>
+
+        <a class="btn lime big dl" id="downloadAll" href="#">↓ Download all</a>
+      </div>
+    </section>
+
+    <section class="window" id="errCard" hidden aria-labelledby="errTitle">
+      <div class="titlebar red">
+        <div class="win-title"><span class="chip">!</span>ERR.EXE</div>
+        <div class="win-controls" aria-hidden="true"><span></span><span></span><span></span></div>
+      </div>
+      <div class="window-body">
+        <h2 class="win-h2" id="errTitle"></h2>
+        <p class="meta" id="errMsg"></p>
+        <a class="btn primary big" href="/">⇪ Upload something else</a>
+      </div>
+    </section>
+
+    <p class="hintbar">
+      <span><kbd>CTRL</kbd> + <kbd>K</kbd> Command palette</span>
+      <span>Downloads stream straight from the share</span>
+    </p>
+  </main>
+
+  <nav class="dock" aria-label="Dock">
+    <a class="dock-btn" href="/"><span class="di">⇪</span>Home</a>
+    <button class="dock-btn hot" type="button" data-action="download"><span class="di">↓</span>Download</button>
+    <button class="dock-btn" type="button" data-action="copy"><span class="di">⧉</span>Copy</button>
+    <button class="dock-btn" type="button" data-action="palette"><span class="di">⌘</span>Menu</button>
+  </nav>
+
+  <div class="palette" id="palette" hidden>
+    <div class="palette-box" role="dialog" aria-modal="true" aria-label="Command palette">
+      <div class="palette-head">
+        <span>Command palette</span>
+        <span>ESC to close</span>
+      </div>
+      <input id="paletteInput" type="text" placeholder="Type a command…" autocomplete="off" spellcheck="false">
+      <ul id="paletteList"></ul>
+      <div class="palette-foot">↑ ↓ navigate · ENTER run · CTRL+K toggle</div>
+    </div>
+  </div>
+
+  <script src="/share.js"></script>
+</body>
+</html>

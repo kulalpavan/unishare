@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>UniShare OS — share files, folders &amp; text with one link</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div class="deco deco-a" aria-hidden="true"></div>
+  <div class="deco deco-b" aria-hidden="true"></div>
+  <div class="deco deco-c" aria-hidden="true"></div>
+  <svg class="deco deco-d" viewBox="0 0 120 108" aria-hidden="true">
+    <polygon points="60,6 114,102 6,102"></polygon>
+  </svg>
+
+  <header class="menubar">
+    <div class="menubar-left">
+      <a class="brand" href="/"><span class="mark">U</span>UNISHARE</a>
+      <span class="tag">FILE TRANSFER OS · NO ACCOUNTS</span>
+    </div>
+    <div class="menubar-right">
+      <span class="tag">BUILD 1.0</span>
+      <span class="clock" id="clock">--:--</span>
+      <span class="status-dot" title="Online"></span>
+    </div>
+  </header>
+
+  <main class="workspace">
+    <section class="window" aria-labelledby="uploadTitle">
+      <div class="titlebar">
+        <div class="win-title" id="uploadTitle"><span class="chip">01</span>UPLOAD.EXE — NEW SHARE</div>
+        <div class="win-controls" aria-hidden="true"><span></span><span></span><span></span></div>
+      </div>
+      <div class="window-body">
+        <div class="grid-2">
+          <div class="pane">
+            <div class="pane-label">Content</div>
+            <div class="drop" id="drop">
+              <input type="file" id="fileInput" multiple hidden>
+              <input type="file" id="folderInput" webkitdirectory hidden>
+              <p class="drop-hint">Drag &amp; drop files or a whole folder</p>
+              <div class="btn-row">
+                <button type="button" class="btn" id="pickFiles">▤ Choose files</button>
+                <button type="button" class="btn" id="pickFolder">▥ Choose folder</button>
+              </div>
+              <ul class="picked" id="picked" hidden></ul>
+            </div>
+            <label class="opt note-opt">
+              <span>Text note <em>(optional)</em></span>
+              <textarea id="textInput" rows="6" placeholder="…or paste a note to share"></textarea>
+            </label>
+          </div>
+
+          <aside class="pane">
+            <div class="pane-label">Options</div>
+            <label class="opt">
+              <span>Password <em>(optional)</em></span>
+              <input type="password" id="passwordInput" autocomplete="new-password" placeholder="Protect with a password">
+            </label>
+            <div class="opt">
+              <span>Expires <em>(optional)</em></span>
+              <div class="expiry-row">
+                <input type="number" id="expiryValue" min="1" placeholder="0">
+                <select id="expiryUnit">
+                  <option value="none">Never</option>
+                  <option value="minutes">minutes</option>
+                  <option value="hours">hours</option>
+                  <option value="days">days</option>
+                </select>
+              </div>
+            </div>
+
+            <button class="btn primary big" id="uploadBtn">⇪ Create share link</button>
+            <p class="status" id="status" role="status"></p>
+            <div class="shortcut-note">CTRL+K · Command palette</div>
+          </aside>
+        </div>
+      </div>
+    </section>
+
+    <section class="window" id="result" hidden aria-labelledby="resultTitle">
+      <div class="titlebar lime">
+        <div class="win-title" id="resultTitle"><span class="chip">OK</span>SHARE_LINK.EXE</div>
+        <div class="win-controls" aria-hidden="true"><span></span><span></span><span></span></div>
+      </div>
+      <div class="window-body">
+        <h2 class="win-h2">Share ready</h2>
+        <div class="linkline">
+          <a id="shareLink" target="_blank" rel="noopener"></a>
+          <button class="btn cyan" id="copyBtn">⧉ Copy</button>
+        </div>
+        <p class="meta" id="resultMeta"></p>
+      </div>
+    </section>
+
+    <p class="hintbar">
+      <span><kbd>CTRL</kbd> + <kbd>K</kbd> Command palette</span>
+      <span>Drag &amp; drop anywhere in the window</span>
+      <span>Links open for anyone</span>
+    </p>
+  </main>
+
+  <nav class="dock" aria-label="Dock">
+    <button class="dock-btn" type="button" data-action="files"><span class="di">▤</span>Files</button>
+    <button class="dock-btn" type="button" data-action="folder"><span class="di">▥</span>Folder</button>
+    <button class="dock-btn" type="button" data-action="note"><span class="di">✎</span>Note</button>
+    <button class="dock-btn" type="button" data-action="lock"><span class="di">⚿</span>Lock</button>
+    <button class="dock-btn hot" type="button" data-action="upload"><span class="di">⇪</span>Share</button>
+    <button class="dock-btn" type="button" data-action="copy"><span class="di">⧉</span>Copy</button>
+    <button class="dock-btn" type="button" data-action="palette"><span class="di">⌘</span>Menu</button>
+  </nav>
+
+  <div class="palette" id="palette" hidden>
+    <div class="palette-box" role="dialog" aria-modal="true" aria-label="Command palette">
+      <div class="palette-head">
+        <span>Command palette</span>
+        <span>ESC to close</span>
+      </div>
+      <input id="paletteInput" type="text" placeholder="Type a command…" autocomplete="off" spellcheck="false">
+      <ul id="paletteList"></ul>
+      <div class="palette-foot">↑ ↓ navigate · ENTER run · CTRL+K toggle</div>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

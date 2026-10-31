@@ -1,0 +1,76 @@
+UniShare - Problem Statement and Solution
+==========================================
+
+PROBLEM STATEMENT
+-----------------
+Sharing folders, text, and files with other people usually requires accounts,
+third-party cloud drives, or complicated permission setups, and the recipient
+often has to sign in or install something before they can get the content.
+There is a need for a simple website where a user can upload what they want to
+share and instantly get a single share link that anyone can open and download
+from directly.
+
+WHAT THE WEBSITE SHOULD DO
+--------------------------
+1. Upload and share:
+   - Folders
+   - Text (notes / plain text content)
+   - Files (single or multiple)
+2. Generate a share link for every upload.
+3. Allow the share link to be sent to anyone.
+4. Recipients must be able to open the link and download the shared content
+   directly, without creating an account.
+5. Optional password protection:
+   - The uploader can set a password on a share.
+   - The recipient must enter the correct password before viewing or
+     downloading the content.
+6. Password-protected and unprotected shares should both be supported from the
+   same interface.
+
+PROPOSED SOLUTION
+-----------------
+Build a web application ("UniShare") with the following flow:
+
+Upload -> Store -> Generate link -> Share -> Verify password (optional) -> Download
+
+Frontend:
+- A clean upload page where the user selects files, a folder, or types text.
+- Options to set a password and (optionally) an expiry time for the share.
+- After upload, show the generated share link with a copy button.
+
+Backend:
+- Receives the uploaded files/folders/text and stores them under a unique
+  share ID.
+- Returns a short, unique share URL such as:
+    https://<domain>/s/<share-id>
+- Stores share metadata: share ID, content type, file name(s), creation time,
+  optional expiry, and password hash (never the plain password).
+- Streaming download endpoint so large files and folders are downloaded
+  directly (folders served as a ZIP archive).
+
+Password protection:
+- If a share has a password, the link opens a password prompt first.
+- The password is verified on the server (hashed, e.g. bcrypt/argon2).
+- After successful verification, a short-lived token/cookie grants access to
+  view/download that share's content.
+- Non-password shares open directly.
+
+Recipient experience:
+- Open link -> (enter password if required) -> preview text or see file/folder
+  list -> download directly, no sign-up needed.
+
+Suggested tech stack (can be adjusted):
+- Frontend: React / Next.js
+- Backend: Node.js API (or Next.js API routes)
+- Database: PostgreSQL or SQLite for share metadata
+- File storage: local disk for development, S3-compatible storage for
+  production
+- Passwords: bcrypt or argon2 hashing
+- Cleanup: scheduled job to delete expired shares and their files
+
+Key considerations:
+- Large uploads need chunked/streamed handling.
+- Folders should preserve their internal structure and be delivered as ZIP.
+- Share links should be hard to guess (random, high-entropy IDs).
+- Optional expiry and download limits add control over shared content.
+- Basic abuse protection (size limits, rate limits) for a public deployment.
