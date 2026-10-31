@@ -27,6 +27,17 @@ const HASH_RE = /^[0-9a-f]{64}$/;
 // register-sender; still bounded so one client can't OOM the server.
 const MAX_SIGNAL_BYTES = 4 * 1024 * 1024;
 const ROOM_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+// Abuse limits: cap the number of live rooms and the total listing bytes
+// held in memory, so one client can't exhaust the free instance's RAM.
+// Overridable via env for tests.
+const MAX_ROOMS = Number(process.env.LIVE_MAX_ROOMS || 1000);
+const MAX_TOTAL_LISTING_BYTES = Number(process.env.LIVE_MAX_LISTING_BYTES || 32 * 1024 * 1024);
+const RATE_LIMIT = Number(process.env.LIVE_RATE_LIMIT || 120);
+const RATE_WINDOW_MS = Number(process.env.LIVE_RATE_WINDOW_MS || 10000);
+// Expired share ids are remembered so a sender that auto-reconnects can't
+// resurrect an expired share as never-expiring.
+const TOMBSTONE_TTL_MS = 24 * 60 * 60 * 1000;
+const MAX_TOMBSTONES = 5000;
 
 const app = express();
 app.disable('x-powered-by');
@@ -37,6 +48,9 @@ app.use(express.json());
 app.use((req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('Referrer-Policy', 'no-referrer');
+  // No inline scripts or styles exist in the pages, and JSZip is vendored
+  // locally, so a strict policy costs nothing and blocks injected scripts.
+  res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self' ws: wss:; img-src 'self' data: blob:; media-src 'none'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'");
   if (process.env.NODE_ENV === 'production') {
     res.setHeader('Strict-Transport-Security', 'max-age=15552000; includeSubDomains');
   }
@@ -44,14 +58,21 @@ app.use((req, res, next) => {
 });
 
 // ICE servers for WebRTC peer connections. Configure via ICE_SERVERS env var
-// (JSON array). Defaults to Google's free public STUN server; add a free TURN
-// entry (e.g. Open Relay Project) for symmetric-NAT fallback.
+// (JSON array). Defaults to Google's free public STUN server plus the Open
+// Relay Project's free shared TURN servers: without TURN, two browsers
+// behind symmetric NATs (common on mobile networks) can never connect
+// directly. The Open Relay credentials below are the project's published
+// shared demo credentials; heavy users should get their own free ones.
 function iceServers() {
   try {
     const parsed = process.env.ICE_SERVERS ? JSON.parse(process.env.ICE_SERVERS) : null;
     if (Array.isArray(parsed) && parsed.length) return parsed;
   } catch {}
-  return [{ urls: 'stun:stun.l.google.com:19302' }];
+  return [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
+    { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' }
+  ];
 }
 
 app.get('/api/health', (req, res) => {
@@ -88,6 +109,41 @@ const server = http.createServer(app);
 // ---------------------------------------------------------------------------
 
 const liveRooms = new Map(); // shareId -> { sender, receivers, listing, passwordHash, expiresAt, createdAt }
+const expiredIds = new Map(); // shareId -> tombstone timestamp (expiry resurrection guard)
+let totalListingBytes = 0;
+
+function listingBytesOf(listing) {
+  try { return listing ? JSON.stringify(listing).length : 0; } catch { return 0; }
+}
+
+function deleteRoom(id) {
+  const room = liveRooms.get(id);
+  if (!room) return;
+  totalListingBytes -= listingBytesOf(room.listing);
+  if (totalListingBytes < 0) totalListingBytes = 0;
+  liveRooms.delete(id);
+}
+
+// Expire a room: tombstone the id so it can't be re-registered, tell the
+// sender it expired (so it stops reconnecting), and close receivers out.
+function expireRoom(id) {
+  const room = liveRooms.get(id);
+  if (!room) return;
+  deleteRoom(id);
+  expiredIds.set(id, Date.now());
+  if (expiredIds.size > MAX_TOMBSTONES) {
+    const oldest = expiredIds.keys().next().value;
+    expiredIds.delete(oldest);
+  }
+  if (room.sender) {
+    liveSend(room.sender.ws, { type: 'expired' });
+    try { room.sender.ws.close(); } catch {}
+  }
+  for (const receiver of room.receivers.values()) {
+    liveSend(receiver, { type: 'error', code: 'share-expired' });
+    try { receiver.close(); } catch {}
+  }
+}
 
 const wss = new WebSocketServer({ server, path: '/live', maxPayload: MAX_SIGNAL_BYTES });
 
@@ -116,12 +172,7 @@ function getLiveRoom(id) {
   const room = liveRooms.get(id);
   if (!room) return null;
   if (roomExpired(room)) {
-    if (room.sender) { try { room.sender.ws.close(); } catch {} }
-    for (const receiver of room.receivers.values()) {
-      liveSend(receiver, { type: 'error', code: 'share-expired' });
-      try { receiver.close(); } catch {}
-    }
-    liveRooms.delete(id);
+    expireRoom(id);
     return null;
   }
   return room;
@@ -131,7 +182,7 @@ function pruneRoom(id) {
   const room = liveRooms.get(id);
   if (!room) return;
   const senderGone = !room.sender || room.sender.ws.readyState !== room.sender.ws.OPEN;
-  if (senderGone && room.receivers.size === 0) liveRooms.delete(id);
+  if (senderGone && room.receivers.size === 0) deleteRoom(id);
 }
 
 wss.on('connection', ws => {
@@ -139,6 +190,7 @@ wss.on('connection', ws => {
   ws._role = null;
   ws._roomId = null;
   ws._alive = true;
+  ws._msgTimestamps = [];
   ws.on('pong', () => { ws._alive = true; });
   ws.on('error', err => {
     console.error('[live] socket error:', err.message);
@@ -146,6 +198,14 @@ wss.on('connection', ws => {
   });
 
   ws.on('message', async raw => {
+    // Per-socket rate limit (sliding window). Legitimate handshakes need
+    // only a few dozen messages; floods get dropped with an error.
+    const nowMs = Date.now();
+    ws._msgTimestamps = ws._msgTimestamps.filter(t => nowMs - t < RATE_WINDOW_MS);
+    if (ws._msgTimestamps.length >= RATE_LIMIT) {
+      return liveSend(ws, { type: 'error', code: 'rate-limited' });
+    }
+    ws._msgTimestamps.push(nowMs);
     let msg;
     try {
       msg = JSON.parse(raw.toString('utf8'));
@@ -164,6 +224,23 @@ wss.on('connection', ws => {
         if (msg.passwordHash != null && !HASH_RE.test(msg.passwordHash)) {
           return liveSend(ws, { type: 'error', code: 'bad-message' });
         }
+        if (expiredIds.has(msg.id)) {
+          liveSend(ws, { type: 'error', code: 'share-expired' });
+          try { ws.close(); } catch {}
+          return;
+        }
+        const newListingBytes = listingBytesOf(msg.listing && typeof msg.listing === 'object' ? msg.listing : null);
+        const oldListingBytes = liveRooms.has(msg.id) ? listingBytesOf(liveRooms.get(msg.id).listing) : 0;
+        if (!liveRooms.has(msg.id) && liveRooms.size >= MAX_ROOMS) {
+          liveSend(ws, { type: 'error', code: 'room-limit' });
+          try { ws.close(); } catch {}
+          return;
+        }
+        if (totalListingBytes - oldListingBytes + newListingBytes > MAX_TOTAL_LISTING_BYTES) {
+          liveSend(ws, { type: 'error', code: 'listing-limit' });
+          try { ws.close(); } catch {}
+          return;
+        }
         const expiresAt = typeof msg.expiresAt === 'number' && msg.expiresAt > Date.now()
           ? msg.expiresAt
           : null;
@@ -171,6 +248,7 @@ wss.on('connection', ws => {
         if (room && room.sender && room.sender.ws.readyState === room.sender.ws.OPEN) {
           try { room.sender.ws.close(); } catch {}
         }
+        totalListingBytes += newListingBytes - oldListingBytes;
         room = {
           sender: { ws, id: ws._id },
           receivers: room ? room.receivers : new Map(),
@@ -189,10 +267,19 @@ wss.on('connection', ws => {
         if (typeof msg.id !== 'string' || !ID_RE.test(msg.id)) {
           return liveSend(ws, { type: 'error', code: 'bad-id' });
         }
+        // Report expiry with its own code instead of "not found".
+        const raw = liveRooms.get(msg.id);
+        if (raw && roomExpired(raw)) {
+          expireRoom(msg.id);
+          return liveSend(ws, { type: 'error', code: 'share-expired' });
+        }
         const room = getLiveRoom(msg.id);
         if (!room) return liveSend(ws, { type: 'error', code: 'share-not-found' });
         const senderOnline = !!(room.sender && room.sender.ws.readyState === room.sender.ws.OPEN);
         if (!senderOnline) return liveSend(ws, { type: 'error', code: 'sender-offline' });
+        if (room.receivers.size >= 20) {
+          return liveSend(ws, { type: 'error', code: 'room-full' });
+        }
         if (room.passwordHash && !hashesEqual(room.passwordHash, msg.passwordHash)) {
           return liveSend(ws, { type: 'error', code: 'wrong-password' });
         }
@@ -256,16 +343,11 @@ wss.on('connection', ws => {
 setInterval(() => {
   for (const [id, room] of liveRooms) {
     if (roomExpired(room)) {
-      if (room.sender) { try { room.sender.ws.close(); } catch {} }
-      for (const receiver of room.receivers.values()) {
-        liveSend(receiver, { type: 'error', code: 'share-expired' });
-        try { receiver.close(); } catch {}
-      }
-      liveRooms.delete(id);
+      expireRoom(id);
       continue;
     }
     const senderGone = !room.sender || room.sender.ws.readyState !== room.sender.ws.OPEN;
-    if (senderGone && room.receivers.size === 0) liveRooms.delete(id);
+    if (senderGone && room.receivers.size === 0) deleteRoom(id);
   }
   for (const ws of wss.clients) {
     if (!ws._alive) { try { ws.terminate(); } catch {} continue; }
@@ -274,15 +356,18 @@ setInterval(() => {
   }
 }, 30 * 1000).unref();
 
-// Absolute room age cap.
+// Absolute room age cap + tombstone cleanup.
 setInterval(() => {
   const now = Date.now();
   for (const [id, room] of liveRooms) {
     if (now - room.createdAt > ROOM_MAX_AGE_MS) {
       if (room.sender) { try { room.sender.ws.close(); } catch {} }
       for (const receiver of room.receivers.values()) { try { receiver.close(); } catch {} }
-      liveRooms.delete(id);
+      deleteRoom(id);
     }
+  }
+  for (const [id, at] of expiredIds) {
+    if (now - at > TOMBSTONE_TTL_MS) expiredIds.delete(id);
   }
 }, 5 * 60 * 1000).unref();
 

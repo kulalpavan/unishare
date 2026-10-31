@@ -174,6 +174,16 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
   assert.equal(receiverPc.closed, false, 'peer connection kept alive for the transfer');
   receiver2.close();
   console.log('ok - signaling drop after the data channel opens is ignored, transfer survives');
+
+  // --- 4. An expired share stops the sender reconnecting ------------------
+  const registersBefore = hub.registers;
+  const socketsBefore = sockets.length;
+  const senderSocket = hub.rooms.get('reconnect-room').sender;
+  senderSocket.emit('message', { data: JSON.stringify({ type: 'expired' }) });
+  await sleep(2500);
+  assert.equal(hub.registers, registersBefore, 'expired sender does not re-register');
+  assert.equal(sockets.length, socketsBefore, 'expired sender opens no new socket');
+  console.log('ok - expired share stops reconnecting, no resurrection');
   console.log('reconnect-verify: all checks passed');
   process.exit(0);
 })().catch(err => { console.error('reconnect-verify FAILED:', err); process.exit(1); });

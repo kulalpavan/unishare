@@ -4,6 +4,13 @@
  * Usage: node test/live-verify.js
  */
 
+// Small caps so the limit tests below run fast; the mechanism is the same
+// as the production defaults.
+process.env.LIVE_MAX_ROOMS = '4';
+process.env.LIVE_MAX_LISTING_BYTES = '2048';
+process.env.LIVE_RATE_LIMIT = '30';
+process.env.LIVE_RATE_WINDOW_MS = '10000';
+
 const assert = require('node:assert');
 const crypto = require('node:crypto');
 const WebSocket = require('ws');
@@ -95,7 +102,7 @@ async function main() {
   stranger.close();
   console.log('ok - unknown share rejected');
 
-  // 7. Expired rooms are rejected.
+  // 7. Expired rooms are rejected with the expiry code (not "not found").
   const expSender = await connect();
   expSender.send(JSON.stringify({
     type: 'register-sender',
@@ -111,10 +118,10 @@ async function main() {
   late.send(JSON.stringify({ type: 'join', id: 'expiredshare123456', passwordHash: null }));
   const expired = await nextMessage(late);
   assert.equal(expired.type, 'error');
-  assert.equal(expired.code, 'share-not-found');
+  assert.equal(expired.code, 'share-expired');
   late.close();
   expSender.close();
-  console.log('ok - expired rooms are gone');
+  console.log('ok - expired rooms report share-expired');
 
   // 8. Sender disconnect notifies the receiver.
   sender.close();
@@ -151,6 +158,67 @@ async function main() {
   assert.equal(survivorRegistered.type, 'registered');
   survivor.close();
   console.log('ok - oversized message kills only its own socket, server survives');
+
+  // 11. An expired share id can't be re-registered (tombstone): the sender
+  // gets share-expired and the id stays dead.
+  const resurrect = await connect();
+  resurrect.send(JSON.stringify({
+    type: 'register-sender',
+    id: 'expiredshare123456',
+    listing: { kind: 'note', files: [], hasText: true },
+    passwordHash: null,
+    expiresAt: null
+  }));
+  const tombstoned = await nextMessage(resurrect);
+  assert.equal(tombstoned.type, 'error');
+  assert.equal(tombstoned.code, 'share-expired');
+  resurrect.close();
+  console.log('ok - expired ids stay expired, no resurrection');
+
+  // 12. Flooding one socket trips the rate limit.
+  const flooder = await connect();
+  const replies = [];
+  flooder.on('message', raw => replies.push(JSON.parse(raw.toString())));
+  for (let i = 0; i < 35; i++) {
+    flooder.send(JSON.stringify({ type: 'join', id: 'doesnotexist12345', passwordHash: null }));
+  }
+  await new Promise(r => setTimeout(r, 300));
+  assert.ok(replies.slice(0, 30).every(m => m.code === 'share-not-found'), 'first burst answered normally');
+  assert.ok(replies.some(m => m.code === 'rate-limited'), 'burst past the limit is rate-limited');
+  flooder.close();
+  console.log('ok - message floods are rate-limited');
+
+  // 13. Room count and total listing bytes are capped.
+  const bigListing = { kind: 'files', files: Array.from({ length: 60 }, (_, i) => ({ path: `folder/file-${i}.bin`, size: i })), hasText: false };
+  assert.ok(JSON.stringify(bigListing).length > 2048, 'test listing exceeds the test cap');
+  const tooBig = await connect();
+  tooBig.send(JSON.stringify({
+    type: 'register-sender', id: 'biglistingroom12', listing: bigListing, passwordHash: null, expiresAt: null
+  }));
+  const capped = await nextMessage(tooBig);
+  assert.equal(capped.type, 'error');
+  assert.equal(capped.code, 'listing-limit');
+  tooBig.close();
+  const roomSockets = [];
+  for (let i = 0; i < 4; i++) {
+    const s = await connect();
+    roomSockets.push(s);
+    s.send(JSON.stringify({
+      type: 'register-sender', id: `caproom${i}123456789`, listing: { kind: 'note', files: [], hasText: true }, passwordHash: null, expiresAt: null
+    }));
+    const reg = await nextMessage(s);
+    assert.equal(reg.type, 'registered');
+  }
+  const fifth = await connect();
+  fifth.send(JSON.stringify({
+    type: 'register-sender', id: 'caproom4123456789', listing: { kind: 'note', files: [], hasText: true }, passwordHash: null, expiresAt: null
+  }));
+  const roomCapped = await nextMessage(fifth);
+  assert.equal(roomCapped.type, 'error');
+  assert.equal(roomCapped.code, 'room-limit');
+  fifth.close();
+  for (const s of roomSockets) s.close();
+  console.log('ok - room count and listing memory are capped');
 
   server.close();
   console.log('live-verify: all checks passed');

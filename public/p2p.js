@@ -25,6 +25,18 @@
   // throws — which surfaced as a generic failure a few seconds after the
   // listing appeared. Split big JSON messages into small parts instead.
   const JSON_CHUNK_SIZE = 60000;
+  // Cap reassembled JSON messages: a header claiming more parts than this
+  // is rejected instead of allocating a giant array (a malicious sender
+  // could otherwise OOM the receiver's tab). 200 parts * 60KB = 12MB,
+  // far above any legitimate manifest (bounded by the 4MB signaling cap).
+  const MAX_JSON_PARTS = 200;
+  // Fallback ICE servers if the hub returns none: STUN plus the Open Relay
+  // Project's free shared TURN servers (same default as the server).
+  const DEFAULT_ICE_SERVERS = [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
+    { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' }
+  ];
 
   function sendJson(dc, obj) {
     const s = JSON.stringify(obj);
@@ -45,6 +57,9 @@
   }
 
   async function sha256Hex(text) {
+    if (!crypto.subtle) {
+      throw new Error('Password protection needs HTTPS — this page was opened over plain HTTP.');
+    }
     const data = new TextEncoder().encode(text);
     const digest = await crypto.subtle.digest('SHA-256', data);
     return [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, '0')).join('');
@@ -145,10 +160,17 @@
         if (msg.t === 'get-file') {
           const entry = filesByPath.get(msg.path);
           if (!entry) {
-            sendJson(dc, { t: 'error', message: `File not found: ${msg.path}` });
+            // Per-file failure: report just this file so the receiver can
+            // keep downloading the rest instead of failing the session.
+            sendJson(dc, { t: 'file-error', path: msg.path, message: `File not found: ${msg.path}` });
             return;
           }
-          await sendFile(dc, entry.file, msg.path, onProgress);
+          try {
+            await sendFile(dc, entry.file, msg.path, onProgress);
+          } catch (err) {
+            sendJson(dc, { t: 'file-error', path: msg.path, message: err.message });
+            return;
+          }
           if (onFileSent) onFileSent(msg.path);
         } else if (msg.t === 'get-text') {
           sendJson(dc, { t: 'text', text });
@@ -171,9 +193,10 @@
     const peers = new Map(); // receiverId -> { pc, dc }
     const pendingSignals = new Map(); // receiverId -> [data] received before the peer existed
     let socket = null;
-    let iceServers = [{ urls: 'stun:stun.l.google.com:19302' }];
+    let iceServers = DEFAULT_ICE_SERVERS.slice();
     let closed = false;
     let everRegistered = false;
+    let expired = false;
     let reconnectTimer = null;
     let reconnectAttempts = 0;
     const MAX_RECONNECT_ATTEMPTS = 30;
@@ -205,7 +228,7 @@
         register();
       }, { once: true });
       socket.addEventListener('close', () => {
-        if (closed || !everRegistered) return;
+        if (closed || expired || !everRegistered) return;
         if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
           setStatus('Live sharing ended. The share link no longer works.');
           return;
@@ -225,6 +248,14 @@
         if (peers.size === 0) setStatus('Live: waiting for the receiver. Keep this tab open.');
         return;
       }
+      if (msg.type === 'expired') {
+        // The share lapsed: stop reconnecting so it can't resurrect.
+        expired = true;
+        clearTimeout(reconnectTimer);
+        setStatus('This share has expired.');
+        try { socket.close(); } catch {}
+        return;
+      }
       if (msg.type === 'receiver-joined') {
         const receiverId = msg.receiverId;
         const pc = makePeerConnection(iceServers, data => {
@@ -234,6 +265,7 @@
           if (pc.connectionState === 'failed') {
             try { pc.close(); } catch {}
             peers.delete(receiverId);
+            pendingSignals.delete(receiverId);
           }
         };
         peers.set(receiverId, { pc, dc: null });
@@ -254,6 +286,7 @@
       if (msg.type === 'receiver-left') {
         const peer = peers.get(msg.receiverId);
         if (peer) { try { peer.pc.close(); } catch {} peers.delete(msg.receiverId); }
+        pendingSignals.delete(msg.receiverId);
         if (onReceiverLeft) onReceiverLeft(msg.receiverId);
         setStatus('Receiver left. Keep this tab open for another download, or close it to end the share.');
         return;
@@ -305,13 +338,13 @@
   async function startReceiver(opts) {
     const {
       id, passwordHash, timeoutMs, onStatus, onJoin, onManifest, onText, onFileStart,
-      onFileProgress, onFileComplete, onDone, onError
+      onFileProgress, onFileComplete, onFileError, onDone, onError
     } = opts;
 
     let socket = null;
     let pc = null;
     let dc = null;
-    let iceServers = [{ urls: 'stun:stun.l.google.com:19302' }];
+    let iceServers = DEFAULT_ICE_SERVERS.slice();
     let settled = false;
     let currentFile = null; // { path, size, chunks, received }
     let joinTimer = null;
@@ -464,6 +497,10 @@
         try { msg = JSON.parse(event.data); } catch { return; }
         // Reassemble a chunked JSON message, then handle it as one message.
         if (msg.t === 'json-start') {
+          if (!Number.isInteger(msg.parts) || msg.parts < 1 || msg.parts > MAX_JSON_PARTS) {
+            jsonParts = null;
+            return;
+          }
           jsonParts = new Array(msg.parts).fill(null);
           return;
         }
@@ -480,6 +517,11 @@
         if (msg.t === 'manifest' && onManifest) onManifest(msg);
         if (msg.t === 'text' && onText) onText(msg.text);
         if (msg.t === 'error') fail(new Error(msg.message || 'transfer-error'));
+        if (msg.t === 'file-error') {
+          // Only this file failed; the session stays alive for the rest.
+          if (currentFile && currentFile.path === msg.path) currentFile = null;
+          if (onFileError) onFileError(msg.path, msg.message || 'transfer-error');
+        }
         if (msg.t === 'file-start') {
           currentFile = { path: msg.path, size: msg.size, chunks: [], received: 0 };
           if (onFileStart) onFileStart(msg.path, msg.size);

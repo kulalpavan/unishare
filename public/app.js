@@ -64,15 +64,31 @@ folderInput.addEventListener('change', () => { setPicked(folderInput.files, 'fol
 ['dragleave', 'drop'].forEach(ev =>
   drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove('over'); }));
 drop.addEventListener('drop', e => {
-  const items = [...(e.dataTransfer.items || [])];
+  e.preventDefault();
+  drop.classList.remove('over');
+  handleDataTransfer(e.dataTransfer);
+});
+
+// Drops outside the drop box must not navigate the page away (which would
+// destroy the sender tab and any live share). Handle them the same way,
+// and stop the browser's default file-open behavior everywhere.
+document.addEventListener('dragover', e => e.preventDefault());
+document.addEventListener('drop', e => {
+  e.preventDefault();
+  if (drop.contains(e.target)) return; // the drop box handles its own drops
+  handleDataTransfer(e.dataTransfer);
+});
+
+function handleDataTransfer(dt) {
+  const items = [...(dt.items || [])];
   const entries = items.map(i => i.webkitGetAsEntry && i.webkitGetAsEntry()).filter(Boolean);
   if (!entries.length) {
-    setPicked(e.dataTransfer.files, 'files');
+    setPicked(dt.files, 'files');
     return;
   }
   const hasDir = entries.some(en => en.isDirectory);
   readAllEntries(entries, '').then(files => setPicked(files, hasDir ? 'folder' : 'files'));
-});
+}
 
 function readAllEntries(entries, prefix) {
   const files = [];
@@ -170,8 +186,14 @@ async function doUpload() {
     statusEl.classList.add('err');
     return;
   }
-  if (expiryValue.value && expiryUnit.value === 'none') {
+  if (expiryValue.value !== '' && expiryUnit.value === 'none') {
     statusEl.textContent = 'Pick a unit (minutes/hours/days) for the expiry you entered.';
+    statusEl.classList.add('err');
+    return;
+  }
+  const expiryNum = Number(expiryValue.value);
+  if (expiryValue.value !== '' && (!Number.isFinite(expiryNum) || expiryNum < 1)) {
+    statusEl.textContent = 'Expiry must be at least 1, or leave it empty for never.';
     statusEl.classList.add('err');
     return;
   }
@@ -207,11 +229,12 @@ async function doUpload() {
     } else {
       const tops = new Set(files.map(f => f.path.split('/')[0]));
       const allNested = files.every(f => f.path.includes('/'));
-      if (pickedKind === 'folder' || (pickedKind !== 'files' && tops.size === 1 && allNested)) {
-        if (tops.size !== 1 || !allNested) throw new Error('A folder upload must keep its files inside one top-level folder.');
+      if (pickedKind === 'folder' && tops.size === 1 && allNested) {
         kind = 'folder';
         folderName = files[0].path.split('/')[0];
       } else {
+        // Multiple top-level folders, or a mix: share as a flat file list
+        // with full paths preserved (the zip keeps the structure).
         kind = 'files';
       }
     }
@@ -258,10 +281,11 @@ async function doUpload() {
         renderLiveFiles();
       },
       onTransferComplete: () => {
-        liveDone = true;
+        // Only this receiver is done; others may still be downloading, so
+        // keep the close-tab guard until the user stops sharing.
         for (const p of liveFileState.keys()) liveFileState.set(p, 'done');
         renderLiveFiles();
-        setLiveStatus('✓ Receiver downloaded everything. You can safely close this tab now.', 'ok');
+        setLiveStatus('✓ A receiver downloaded everything. Keep this tab open until every receiver is done.', 'ok');
         updateTabWarning();
       }
     });

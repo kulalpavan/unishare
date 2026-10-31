@@ -9,16 +9,17 @@ Share files, folders, and text notes with a single no-login link. **100% peer-to
 - Folder shares stay a folder: downloads are re-zipped in the receiver's browser, preserving the folder structure
 - Optional password protection (SHA-256 hash comparison — plaintext passwords never leave the browser)
 - Optional expiry (minutes / hours / days) — the room closes when it lapses
-- The sender **must keep the tab open** until the receiver finishes downloading; closing the tab ends the share
-- The sender's page shows live status: receiver connected, per-file progress, and a confirmation when the receiver has downloaded everything
-- Rate limits on signaling messages (payload caps, one sender per room)
+- The sender **must keep the tab open** until the receiver finishes downloading; closing the tab ends the share. If the connection drops briefly, both sides reconnect automatically and the transfer survives.
+- The sender's page shows live status: receiver connected, per-file progress, and a confirmation when a receiver has downloaded everything
+- Signaling is capped and rate-limited (message size caps, per-socket rate limits, room and listing-memory limits) so one client can't exhaust the free server
+- Text notes are downloadable (as `note.txt`, included in folder zips too); folders can be dropped anywhere on the page, including several folders at once
 
 ## How it works
 
 1. The sender picks files, a folder, or types a text note, optionally sets a password and expiry, and creates a link. The sender's tab registers as the live sender for that share id.
 2. The receiver opens the link. The page joins the signaling room (password hash checked server-side), then connects directly to the sender's browser over WebRTC.
-3. Files stream in 16 KB chunks over a WebRTC data channel; folders are re-zipped in the receiver's browser (JSZip, loaded from CDN, with per-file downloads as fallback).
-4. When the download finishes, the receiver notifies the sender, whose page shows "Receiver downloaded everything" — safe to close the tab.
+3. Files stream in 16 KB chunks over a WebRTC data channel; folders are re-zipped in the receiver's browser (JSZip, vendored locally, with per-file downloads as fallback). Large manifests and long notes are split into small messages so they fit the data channel's limits.
+4. When the download finishes, the receiver notifies the sender, whose page shows a confirmation. Expired shares stay expired: the id can't be re-registered.
 5. If the sender closes the tab first, the link stops working immediately.
 
 ## Local setup
@@ -35,10 +36,10 @@ Then open http://localhost:3000.
 ## Tests
 
 ```sh
-npm run verify:live
+npm run verify        # all suites: signaling hub, chunking, reconnects
 ```
 
-Covers the signaling hub without any database: sender registration, password-hash join verification, signal relay both ways, transfer-complete notification, unknown/expired/dead rooms, and sender-disconnect notification.
+Covers the signaling hub without any database: sender registration, password-hash join verification, signal relay both ways, transfer-complete notification, unknown/expired/dead rooms, sender-disconnect notification, oversized-message survival, rate limiting, room/listing caps, and expiry tombstones (expired ids can't be re-registered). The chunking suite drives the real transfer code with stubbed sockets/peers: an 8000-file manifest, a 340KB note, and per-file failures that leave the session alive. The reconnect suite proves senders re-register after a drop, receivers retry early joins, and signaling drops after the data channel opens are ignored.
 
 ## Environment variables
 
@@ -47,7 +48,7 @@ Covers the signaling hub without any database: sender registration, password-has
 | `PORT` | `3000` | Port to listen on |
 | `ICE_SERVERS` | Google STUN | JSON array of WebRTC ICE servers (see below) |
 
-ICE servers are configured with the `ICE_SERVERS` env var (JSON array); the default is Google's free public STUN server. Behind symmetric NATs (common on mobile networks) direct connections fail without a TURN server — add a free TURN entry, e.g. from the Open Relay Project. See `.env.example`.
+ICE servers are configured with the `ICE_SERVERS` env var (JSON array); the default is Google's free public STUN server plus the Open Relay Project's free shared TURN servers, so direct connections work behind symmetric NATs (common on mobile networks) too. The default TURN credentials are the project's published shared demo credentials — get your own free ones for heavy use. See `.env.example`.
 
 ## Deploy to Render
 

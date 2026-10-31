@@ -139,6 +139,9 @@ const { startSender, startReceiver } = sandbox.UniShareLive;
 
   let gotManifest = null;
   let gotText = null;
+  let fileError = null;
+  let sessionErrors = 0;
+  let receiverHandle = null;
   const done = new Promise(resolve => {
     startReceiver({
       id: 'big-room-test', passwordHash: null, timeoutMs: 5000,
@@ -146,8 +149,10 @@ const { startSender, startReceiver } = sandbox.UniShareLive;
       onManifest: msg => { gotManifest = msg; },
       onText: text => { gotText = text; resolve(); },
       onFileStart: () => {}, onFileProgress: () => {}, onFileComplete: () => {},
-      onDone: () => {}, onError: err => { throw err; }
+      onFileError: (path, message) => { fileError = { path, message }; },
+      onDone: () => {}, onError: () => { sessionErrors++; }
     }).then(receiver => {
+      receiverHandle = receiver;
       // The receiver asks for the text once the manifest arrives; emulate
       // that here once we see the manifest (poll briefly).
       const iv = setInterval(() => {
@@ -172,6 +177,19 @@ const { startSender, startReceiver } = sandbox.UniShareLive;
   assert.ok(senderDc.sent.length > 2, 'manifest was actually chunked into several sends');
   console.log('ok - 8000-file manifest chunked and reassembled exactly');
   console.log('ok - 340KB text note chunked and reassembled exactly');
+
+  // A missing file fails per-file: the session stays alive and the text
+  // can still be fetched afterwards.
+  receiverHandle.requestFile('big-folder/does-not-exist.bin');
+  await new Promise(r => setTimeout(r, 100));
+  assert.ok(fileError, 'file-error reported for the missing file');
+  assert.equal(fileError.path, 'big-folder/does-not-exist.bin');
+  assert.equal(sessionErrors, 0, 'a single bad file does not kill the session');
+  gotText = null;
+  receiverHandle.requestText();
+  await new Promise(r => setTimeout(r, 100));
+  assert.equal(gotText, bigText, 'session still serves requests after a file error');
+  console.log('ok - per-file failure is isolated, session survives');
   console.log('chunk-verify: all checks passed');
   process.exit(0);
 })().catch(err => { console.error('chunk-verify FAILED:', err); process.exit(1); });

@@ -4,7 +4,10 @@ const shareId = location.pathname.split('/')[2];
 let passwordHash = null;
 let liveReceiver = null;
 let listing = null;
+let noteText = null;
+let notePromiseResolve = null;
 let liveFileResolver = null;
+let liveFileTimer = null;
 let transferNotified = false;
 let downloading = false;
 
@@ -46,6 +49,9 @@ async function connectShare() {
   try { if (liveReceiver) liveReceiver.close(); } catch {}
   liveReceiver = null;
   listing = null;
+  noteText = null;
+  clearTimeout(liveFileTimer);
+  liveFileTimer = null;
   transferNotified = false;
   $('errCard').hidden = true;
   $('pwCard').hidden = true;
@@ -75,13 +81,30 @@ async function connectShare() {
         if (listing.hasText) liveReceiver.requestText();
       },
       onText: text => {
+        noteText = text;
+        if (notePromiseResolve) notePromiseResolve(text);
         $('textContent').textContent = text;
         $('textBlock').hidden = false;
         if (listing && listing.kind === 'note') notifyDownloaded();
       },
       onFileStart: (path, size) => setLiveStatus(`Receiving ${path}…`),
-      onFileProgress: (path, done, total) =>
-        setLiveStatus(`Receiving ${path} — ${Math.round((done / total) * 100)}%`),
+      onFileProgress: (path, done, total) => {
+        setLiveStatus(`Receiving ${path} — ${Math.round((done / total) * 100)}%`);
+        // A slow transfer is still a live one: the stall timer restarts
+        // on every chunk so large files on slow links don't time out.
+        if (liveFileResolver && liveFileResolver.path === path) armLiveFileTimer();
+      },
+      onFileError: (path, message) => {
+        if (liveFileResolver && liveFileResolver.path === path) {
+          const r = liveFileResolver;
+          liveFileResolver = null;
+          clearTimeout(liveFileTimer);
+          liveFileTimer = null;
+          r.reject(new Error(message || 'That file could not be sent.'));
+        } else {
+          setLiveStatus(`Could not receive ${path} — the other files can still download.`);
+        }
+      },
       onFileComplete: (path, size, blob) => {
         if (liveFileResolver && liveFileResolver.path === path) {
           const r = liveFileResolver;
@@ -184,16 +207,26 @@ function renderListing(data) {
   $('shareCard').hidden = false;
 }
 
+function armLiveFileTimer() {
+  clearTimeout(liveFileTimer);
+  liveFileTimer = setTimeout(() => {
+    if (liveFileResolver) {
+      const r = liveFileResolver;
+      liveFileResolver = null;
+      liveFileTimer = null;
+      r.reject(new Error('Live transfer stalled.'));
+    }
+  }, 10 * 60 * 1000);
+}
+
 function requestOneLiveFile(path) {
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      if (liveFileResolver && liveFileResolver.path === path) liveFileResolver = null;
-      reject(new Error('Live transfer timed out.'));
-    }, 10 * 60 * 1000);
     liveFileResolver = {
       path,
-      resolve: blob => { clearTimeout(timer); resolve(blob); }
+      resolve: blob => { clearTimeout(liveFileTimer); liveFileTimer = null; resolve(blob); },
+      reject: err => { clearTimeout(liveFileTimer); liveFileTimer = null; reject(err); }
     };
+    armLiveFileTimer();
     liveReceiver.requestFile(path);
   });
 }
@@ -209,10 +242,35 @@ function saveBlob(blob, filename) {
   setTimeout(() => URL.revokeObjectURL(url), 5000);
 }
 
+function waitForNote(timeoutMs) {
+  if (noteText != null) return Promise.resolve(noteText);
+  return new Promise(resolve => {
+    const timer = setTimeout(() => { notePromiseResolve = null; resolve(null); }, timeoutMs);
+    notePromiseResolve = text => { clearTimeout(timer); notePromiseResolve = null; resolve(text); };
+  });
+}
+
 async function downloadLive(paths) {
   if (!liveReceiver || !listing || downloading) return;
   const files = (listing.files || []).filter(f => paths.includes(f.path));
-  if (!files.length) return;
+  // Note-only shares (or the note attached to a file share) must be
+  // downloadable too — previously this button did nothing for notes.
+  if (!files.length) {
+    let text = noteText;
+    if (text == null && listing.hasText) {
+      setLiveStatus('Fetching the note…');
+      liveReceiver.requestText();
+      text = await waitForNote(15000);
+    }
+    if (text != null) {
+      saveBlob(new Blob([text], { type: 'text/plain' }), 'note.txt');
+      setLiveStatus('✓ Note downloaded. The sender has been notified.');
+      notifyDownloaded();
+    } else {
+      setLiveStatus('The note has not arrived yet — try again in a moment.');
+    }
+    return;
+  }
   downloading = true;
   const received = [];
   try {
@@ -231,11 +289,13 @@ async function downloadLive(paths) {
     } else if (window.JSZip) {
       const zip = new window.JSZip();
       for (const r of received) zip.file(r.path, r.blob);
+      if (noteText != null) zip.file('note.txt', noteText);
       const zipName = isFolder && listing.folderName ? listing.folderName : (listing.topName || 'unishare');
       const blob = await zip.generateAsync({ type: 'blob' });
       saveBlob(blob, `${zipName}.zip`);
     } else {
       for (const r of received) saveBlob(r.blob, r.path.split('/').pop());
+      if (noteText != null) saveBlob(new Blob([noteText], { type: 'text/plain' }), 'note.txt');
     }
     setLiveStatus('✓ Download complete. The sender has been notified.');
     notifyDownloaded();
