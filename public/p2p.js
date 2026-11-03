@@ -227,6 +227,7 @@
     let reconnectTimer = null;
     let reconnectAttempts = 0;
     let receiverCount = 0;
+    let wakeLock = null;
     const MAX_RECONNECT_ATTEMPTS = 30;
 
     const setStatus = msg => { if (onStatus) onStatus(msg); };
@@ -237,13 +238,20 @@
       }
     };
 
-    const register = () => sendSocket({
-      type: 'register-sender',
-      id,
-      listing,
-      passwordHash: passwordHash || null,
-      expiresAt: expiresAt || null
-    });
+    const register = () => {
+      // The share counts as attempted the moment registration is sent:
+      // if this socket dies before the server's reply lands (the tab
+      // was backgrounded in the same instant), the close handler must
+      // still reconnect and re-register instead of giving up.
+      everRegistered = true;
+      sendSocket({
+        type: 'register-sender',
+        id,
+        listing,
+        passwordHash: passwordHash || null,
+        expiresAt: expiresAt || null
+      });
+    };
 
     // Build (or rebuild) the peer connection for one receiver: used when a
     // receiver joins, and again when a receiver restarts its connection
@@ -314,11 +322,53 @@
       });
     }
 
+    // Keep the screen awake while this tab is the sender: on a phone,
+    // a sleeping screen is the fastest way for the OS to suspend the
+    // tab and drop the share.
+    async function requestWakeLock() {
+      if (typeof navigator === 'undefined' || !('wakeLock' in navigator)) return;
+      if (wakeLock) return;
+      try {
+        wakeLock = await navigator.wakeLock.request('screen');
+        wakeLock.addEventListener('release', () => { wakeLock = null; });
+      } catch {}
+    }
+    const releaseWakeLock = () => {
+      if (wakeLock) { try { wakeLock.release(); } catch {} wakeLock = null; }
+    };
+
+    // Returning to the tab (or coming back online) must reconnect NOW,
+    // not whenever the backoff timer happens to fire: the user just
+    // came back from sharing the link in another app, and the receiver
+    // may already be waiting on the other end.
+    const nudgeReconnect = () => {
+      if (closed || expired) return;
+      if (socket && socket.readyState === WebSocket.OPEN) return;
+      reconnectAttempts = 0;
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+      connectSocket();
+    };
+    const onVisibilityChange = () => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'visible') {
+        requestWakeLock();
+        nudgeReconnect();
+      }
+    };
+    if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
+      document.addEventListener('visibilitychange', onVisibilityChange);
+    }
+    if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+      window.addEventListener('online', nudgeReconnect);
+    }
+    requestWakeLock();
+
     function onSocketMessage(event) {
       let msg;
       try { msg = JSON.parse(event.data); } catch { return; }
       if (msg.type === 'registered') {
         everRegistered = true;
+        requestWakeLock();
         if (Array.isArray(msg.iceServers) && msg.iceServers.length) iceServers = msg.iceServers;
         // After a mid-share reconnect the "interrupted" notice must not
         // stick: with a receiver already connected, say so explicitly.
@@ -380,7 +430,15 @@
         }
         return;
       }
-      if (msg.type === 'error') setStatus(`Live sharing unavailable: ${msg.code || 'error'}`);
+      if (msg.type === 'error') {
+        // A rejection saying the share expired is final: stop
+        // reconnecting so a dead id can't be revived by the retry loop.
+        if (msg.code === 'share-expired') {
+          expired = true;
+          clearTimeout(reconnectTimer);
+        }
+        setStatus(`Live sharing unavailable: ${msg.code || 'error'}`);
+      }
     }
 
     connectSocket();
@@ -410,6 +468,16 @@
       close() {
         closed = true;
         clearTimeout(reconnectTimer);
+        // Deliberate end: tell the hub so the room dies at once instead
+        // of lingering through the sender grace period.
+        sendSocket({ type: 'stop-sharing' });
+        releaseWakeLock();
+        if (typeof document !== 'undefined' && typeof document.removeEventListener === 'function') {
+          document.removeEventListener('visibilitychange', onVisibilityChange);
+        }
+        if (typeof window !== 'undefined' && typeof window.removeEventListener === 'function') {
+          window.removeEventListener('online', nudgeReconnect);
+        }
         for (const peer of peers.values()) { try { peer.pc.close(); } catch {} }
         peers.clear();
         try { socket.close(); } catch {}
@@ -434,6 +502,13 @@
     let reconnectTimer = null;
     let joinAttempts = 0;
     const MAX_JOIN_ATTEMPTS = 4;
+    let awayTimer = null;
+    let awayDeadline = 0;
+    // How long a receiver waits for an away sender before giving up:
+    // long enough to cover sharing the link in another app and coming
+    // back, short enough that a truly dead link still fails cleanly.
+    const AWAY_WAIT_MS = 5 * 60 * 1000;
+    const AWAY_RETRY_MS = 3000;
     let peerAttempts = 0;
     const MAX_PEER_ATTEMPTS = 2;
     const pendingRequests = [];
@@ -463,6 +538,8 @@
       clearTimeout(joinTimer);
       clearTimeout(connectWatchdog);
       clearTimeout(reconnectTimer);
+      clearTimeout(awayTimer);
+      removeReceiverListeners();
       try { socket.close(); } catch {}
       if (pc) { try { pc.close(); } catch {} }
       if (onError) onError(err);
@@ -493,6 +570,59 @@
       }, 20000);
     };
 
+    // The sender stepped away (backgrounded tab, brief drop) but the
+    // share is still alive in its grace period: keep re-joining every
+    // few seconds instead of failing, until the wait budget runs out.
+    const enterAwayWait = () => {
+      if (settled || dcOpen()) return;
+      clearTimeout(joinTimer);
+      if (!awayDeadline) awayDeadline = Date.now() + AWAY_WAIT_MS;
+      if (onStatus) onStatus('The sender stepped away — waiting for them to come back online…');
+      clearTimeout(awayTimer);
+      awayTimer = setTimeout(() => {
+        if (settled || dcOpen()) return;
+        if (Date.now() > awayDeadline) {
+          fail(new Error('sender-offline'));
+          return;
+        }
+        armJoinTimer();
+        sendSocket({ type: 'join', id, passwordHash: passwordHash || null });
+      }, AWAY_RETRY_MS);
+    };
+
+    // Returning to the tab re-joins at once when the receiver is still
+    // waiting, instead of leaving the join timer to expire mid-wait.
+    const nudgeReceiver = () => {
+      if (settled || dcOpen()) return;
+      if (!socket || socket.readyState !== WebSocket.OPEN) {
+        joinAttempts = 0;
+        clearTimeout(reconnectTimer);
+        connectSocket();
+      } else if (awayDeadline) {
+        clearTimeout(awayTimer);
+        clearTimeout(joinTimer);
+        armJoinTimer();
+        sendSocket({ type: 'join', id, passwordHash: passwordHash || null });
+      }
+    };
+    const onReceiverVisibility = () => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'visible') nudgeReceiver();
+    };
+    if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
+      document.addEventListener('visibilitychange', onReceiverVisibility);
+    }
+    if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+      window.addEventListener('online', nudgeReceiver);
+    }
+    const removeReceiverListeners = () => {
+      if (typeof document !== 'undefined' && typeof document.removeEventListener === 'function') {
+        document.removeEventListener('visibilitychange', onReceiverVisibility);
+      }
+      if (typeof window !== 'undefined' && typeof window.removeEventListener === 'function') {
+        window.removeEventListener('online', nudgeReceiver);
+      }
+    };
+
     // A signaling drop before the data channel opens is retried: the
     // sender may have reconnected under the same id. Once the data
     // channel is open, signaling is no longer needed and its loss is
@@ -510,6 +640,7 @@
       socket.addEventListener('close', () => {
         if (socket !== thisSocket) return; // superseded socket
         if (settled) return;
+        clearTimeout(awayTimer);
         if (dcOpen()) {
           if (onStatus) onStatus('Signaling connection lost — the direct transfer continues.');
           return;
@@ -579,6 +710,14 @@
 
       if (msg.type === 'error') {
         if (dcOpen()) return;
+        // The share exists but its sender is away inside the grace
+        // period (or the join was rate-limited): wait and retry
+        // instead of failing the link.
+        if (msg.code === 'sender-away' || msg.code === 'sender-offline' || msg.code === 'rate-limited') {
+          clearTimeout(joinTimer);
+          enterAwayWait();
+          return;
+        }
         clearTimeout(joinTimer);
         fail(new Error(msg.code || 'error'));
         return;
@@ -586,6 +725,8 @@
 
       if (msg.type === 'joined') {
         clearTimeout(joinTimer);
+        awayDeadline = 0;
+        clearTimeout(awayTimer);
         joinAttempts = 0;
         if (Array.isArray(msg.iceServers) && msg.iceServers.length) iceServers = msg.iceServers;
         if (!msg.senderOnline) {
@@ -601,7 +742,23 @@
 
       if (msg.type === 'sender-offline') {
         if (dcOpen()) return;
-        fail(new Error('sender-offline'));
+        // No direct connection yet and the sender's signaling dropped:
+        // the share may revive inside the grace period, so wait and
+        // re-join instead of failing outright.
+        clearTimeout(joinTimer);
+        enterAwayWait();
+        return;
+      }
+
+      if (msg.type === 'sender-back') {
+        if (settled || dcOpen()) return;
+        // The sender re-registered: re-join now instead of waiting for
+        // the next retry tick.
+        awayDeadline = 0;
+        clearTimeout(awayTimer);
+        clearTimeout(joinTimer);
+        armJoinTimer();
+        sendSocket({ type: 'join', id, passwordHash: passwordHash || null });
         return;
       }
 
@@ -699,6 +856,8 @@
         clearTimeout(joinTimer);
         clearTimeout(connectWatchdog);
         clearTimeout(reconnectTimer);
+        clearTimeout(awayTimer);
+        removeReceiverListeners();
         if (onDone) onDone();
         try { socket.close(); } catch {}
         if (pc) { try { pc.close(); } catch {} }
@@ -708,6 +867,8 @@
         clearTimeout(joinTimer);
         clearTimeout(connectWatchdog);
         clearTimeout(reconnectTimer);
+        clearTimeout(awayTimer);
+        removeReceiverListeners();
         try { socket.close(); } catch {}
         if (pc) { try { pc.close(); } catch {} }
       }

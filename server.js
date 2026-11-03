@@ -38,6 +38,12 @@ const RATE_WINDOW_MS = Number(process.env.LIVE_RATE_WINDOW_MS || 10000);
 // resurrect an expired share as never-expiring.
 const TOMBSTONE_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_TOMBSTONES = 5000;
+// A sender that drops (phone tab backgrounded while sharing the link in
+// another app, brief network loss) gets a grace period: the room is kept
+// so the same link works again when the sender's tab comes back and
+// re-registers, instead of the link dying the instant the socket drops.
+// Overridable via env for tests.
+const SENDER_GRACE_MS = Number(process.env.LIVE_SENDER_GRACE_MS || 10 * 60 * 1000);
 
 const app = express();
 app.disable('x-powered-by');
@@ -109,11 +115,12 @@ app.use((err, req, res, next) => {
 const server = http.createServer(app);
 
 // ---------------------------------------------------------------------------
-// Signaling hub. Rooms are ephemeral in-memory mappings, wiped when the
-// sender's connection drops or the room expires.
+// Signaling hub. Rooms are ephemeral in-memory mappings, kept for a
+// grace period after the sender's connection drops (the sender may be
+// back within minutes) and wiped when they expire or the grace ends.
 // ---------------------------------------------------------------------------
 
-const liveRooms = new Map(); // shareId -> { sender, receivers, listing, passwordHash, expiresAt, createdAt }
+const liveRooms = new Map(); // shareId -> { sender, receivers, listing, passwordHash, expiresAt, createdAt, senderLeftAt }
 const expiredIds = new Map(); // shareId -> tombstone timestamp (expiry resurrection guard)
 let totalListingBytes = 0;
 
@@ -173,6 +180,13 @@ function roomExpired(room) {
   return room.expiresAt !== null && room.expiresAt <= Date.now();
 }
 
+// True once the sender has been gone longer than the grace period. A room
+// whose senderLeftAt was never stamped (sender socket died without a
+// close event) is not expired: the sweep stamps it first.
+function graceExpired(room) {
+  return !room.sender && room.senderLeftAt != null && (Date.now() - room.senderLeftAt > SENDER_GRACE_MS);
+}
+
 function getLiveRoom(id) {
   const room = liveRooms.get(id);
   if (!room) return null;
@@ -187,7 +201,9 @@ function pruneRoom(id) {
   const room = liveRooms.get(id);
   if (!room) return;
   const senderGone = !room.sender || room.sender.ws.readyState !== room.sender.ws.OPEN;
-  if (senderGone && room.receivers.size === 0) deleteRoom(id);
+  // A senderless room survives until the grace period ends, so a sender
+  // that briefly backgrounds the tab can come back to the same link.
+  if (senderGone && room.receivers.size === 0 && graceExpired(room)) deleteRoom(id);
 }
 
 wss.on('connection', ws => {
@@ -260,12 +276,20 @@ wss.on('connection', ws => {
           listing: msg.listing && typeof msg.listing === 'object' ? msg.listing : null,
           passwordHash: msg.passwordHash || null,
           expiresAt,
-          createdAt: Date.now()
+          createdAt: Date.now(),
+          senderLeftAt: null
         };
         liveRooms.set(msg.id, room);
         ws._role = 'sender';
         ws._roomId = msg.id;
-        return liveSend(ws, { type: 'registered', iceServers: iceServers() });
+        liveSend(ws, { type: 'registered', iceServers: iceServers() });
+        // A re-register inside the grace period revives the room: tell
+        // any receivers already waiting that the sender is back, so they
+        // re-join now instead of waiting out their retry delay.
+        for (const receiver of room.receivers.values()) {
+          liveSend(receiver, { type: 'sender-back' });
+        }
+        return;
       }
 
       if (msg.type === 'join') {
@@ -277,6 +301,17 @@ wss.on('connection', ws => {
         if (raw && roomExpired(raw)) {
           expireRoom(msg.id);
           return liveSend(ws, { type: 'error', code: 'share-expired' });
+        }
+        // The share exists but its sender is temporarily away (tab
+        // backgrounded, brief drop): the link is still alive inside the
+        // grace period, so the receiver waits and retries instead of
+        // failing. Once the grace ends the room is gone for good.
+        if (raw && !raw.sender) {
+          if (graceExpired(raw)) {
+            deleteRoom(msg.id);
+            return liveSend(ws, { type: 'error', code: 'share-not-found' });
+          }
+          return liveSend(ws, { type: 'error', code: 'sender-away', retryAfterMs: 3000 });
         }
         const room = getLiveRoom(msg.id);
         if (!room) return liveSend(ws, { type: 'error', code: 'share-not-found' });
@@ -299,6 +334,20 @@ wss.on('connection', ws => {
           iceServers: iceServers()
         });
         liveSend(room.sender.ws, { type: 'receiver-joined', receiverId: ws._id });
+        return;
+      }
+
+      if (msg.type === 'stop-sharing') {
+        // Explicit end from the sender (Stop Sharing button): the room
+        // dies immediately — no grace period, since the sender chose to
+        // end it — and receivers are told it ended on purpose.
+        const room = ws._roomId ? liveRooms.get(ws._roomId) : null;
+        if (!room || ws._role !== 'sender') return;
+        deleteRoom(ws._roomId);
+        for (const receiver of room.receivers.values()) {
+          liveSend(receiver, { type: 'error', code: 'share-ended' });
+          try { receiver.close(); } catch {}
+        }
         return;
       }
 
@@ -332,6 +381,9 @@ wss.on('connection', ws => {
     if (!room) return;
     if (ws._role === 'sender' && room.sender && room.sender.ws === ws) {
       room.sender = null;
+      // Stamp when the sender left: the room now runs out the grace
+      // period instead of being deleted on the spot.
+      room.senderLeftAt = Date.now();
       for (const receiver of room.receivers.values()) {
         liveSend(receiver, { type: 'sender-offline' });
       }
@@ -352,7 +404,10 @@ setInterval(() => {
       continue;
     }
     const senderGone = !room.sender || room.sender.ws.readyState !== room.sender.ws.OPEN;
-    if (senderGone && room.receivers.size === 0) deleteRoom(id);
+    if (senderGone) {
+      if (room.senderLeftAt == null) room.senderLeftAt = Date.now();
+      if (room.receivers.size === 0 && graceExpired(room)) deleteRoom(id);
+    }
   }
   for (const ws of wss.clients) {
     if (!ws._alive) { try { ws.terminate(); } catch {} continue; }

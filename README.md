@@ -9,7 +9,7 @@ Share files, folders, and text notes with a single no-login link. **100% peer-to
 - Folder shares stay a folder: downloads are re-zipped in the receiver's browser, preserving the folder structure
 - Optional password protection (SHA-256 hash comparison — plaintext passwords never leave the browser)
 - Optional expiry (minutes / hours / days) — the room closes when it lapses
-- The sender **must keep the tab open** until the receiver finishes downloading; closing the tab ends the share. If the connection drops briefly, both sides reconnect automatically and the transfer survives.
+- The sender **must keep the tab open** until the receiver finishes downloading; closing the tab ends the share. If the connection drops briefly — including switching to another app to share the link — the room is kept for a 10-minute grace period, both sides reconnect automatically when the tab comes back, and the receiver waits instead of failing. Stopping the share on purpose (Stop Sharing) ends the link immediately.
 - The sender's page shows live status: receiver connected, per-file progress, and a confirmation when a receiver has downloaded everything
 - Ephemeral chat: while the share is open, the sender and receiver can message each other over the same WebRTC data channel. Messages are kept only in the open tabs' memory and are never stored on the server or on disk — closing a tab erases them
 - Signaling is capped and rate-limited (message size caps, per-socket rate limits, room and listing-memory limits) so one client can't exhaust the free server
@@ -22,7 +22,7 @@ Share files, folders, and text notes with a single no-login link. **100% peer-to
 3. Files stream in 16 KB chunks over a WebRTC data channel; folders are re-zipped in the receiver's browser (JSZip, vendored locally, with per-file downloads as fallback). Large manifests and long notes are split into small messages so they fit the data channel's limits.
 4. When the download finishes, the receiver notifies the sender, whose page shows a confirmation. Expired shares stay expired: the id can't be re-registered.
 5. While the share is open, either side can send chat messages over the same data channel — sender to all connected receivers, receivers to the sender. Nothing is stored; the chat dies with the tabs.
-6. If the sender closes the tab first, the link stops working immediately.
+6. If the sender closes the tab first, the link stops working once the 10-minute grace period ends (or immediately if they used Stop Sharing).
 
 ## Local setup
 

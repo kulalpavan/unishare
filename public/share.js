@@ -192,10 +192,16 @@ async function connectShare() {
         if (code === 'share-expired') {
           return showError('Share expired', 'This share has expired.');
         }
+        if (code === 'share-ended') {
+          return showError(
+            'Sender stopped sharing',
+            'The sender ended this share on purpose. Ask them to create a new link if you still need the files.'
+          );
+        }
         if (code === 'sender-offline' || code === 'share-not-found') {
           return showError(
             'Sender is offline',
-            'This link only works while the sender keeps the tab open. Ask them to create the link again.'
+            'The sender is offline. If they reopen the UniShare tab, this same link can work again — otherwise ask them to share a new link.'
           );
         }
         if (code === 'connection-failed') {
@@ -210,7 +216,7 @@ async function connectShare() {
   } catch (err) {
     showError(
       'Sender is offline',
-      'This link only works while the sender keeps the tab open. Ask them to create the link again.'
+      'The sender is offline. If they reopen the UniShare tab, this same link can work again — otherwise ask them to share a new link.'
     );
   }
 }
@@ -387,9 +393,10 @@ $('pwForm').addEventListener('submit', async e => {
   connectShare();
 });
 
-window.addEventListener('pagehide', () => {
-  try { if (liveReceiver) liveReceiver.close(); } catch {}
-});
+// NOTE: no pagehide handler closes the receiver on purpose. Hiding
+// this page (switching apps) must not kill the wait: the receiver
+// retries the join when the tab comes back, and the sender's grace
+// period covers the gap.
 
 function tickClock() {
   const el = $('clock');

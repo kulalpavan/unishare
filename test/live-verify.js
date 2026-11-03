@@ -10,6 +10,9 @@ process.env.LIVE_MAX_ROOMS = '4';
 process.env.LIVE_MAX_LISTING_BYTES = '2048';
 process.env.LIVE_RATE_LIMIT = '30';
 process.env.LIVE_RATE_WINDOW_MS = '10000';
+// Short grace so the reap step below can prove dead rooms are freed;
+// the mechanism is the same as the 10-minute production default.
+process.env.LIVE_SENDER_GRACE_MS = '150';
 
 const assert = require('node:assert');
 const crypto = require('node:crypto');
@@ -130,14 +133,15 @@ async function main() {
   receiver.close();
   console.log('ok - sender disconnect notifies receivers');
 
-  // 9. Joining after the sender left reports sender-offline / not found.
+  // 9. Joining after the sender left reports sender-away while the
+  // grace period runs: the link can revive if the sender comes back.
   const ghost = await connect();
   ghost.send(JSON.stringify({ type: 'join', id: SHARE_ID, passwordHash }));
   const gone = await nextMessage(ghost);
   assert.equal(gone.type, 'error');
-  assert.ok(['sender-offline', 'share-not-found'].includes(gone.code));
+  assert.equal(gone.code, 'sender-away');
   ghost.close();
-  console.log('ok - dead rooms are not joinable');
+  console.log('ok - join during grace reports sender-away, link can revive');
 
   // 10. An oversized message closes only that socket (1009) and never
   // crashes the server: a fresh client must still be able to register.
@@ -187,6 +191,20 @@ async function main() {
   assert.ok(replies.some(m => m.code === 'rate-limited'), 'burst past the limit is rate-limited');
   flooder.close();
   console.log('ok - message floods are rate-limited');
+
+  // 12b. Grace-expired rooms are reaped on the next join, freeing
+  // their room slots: both rooms whose senders closed above are gone
+  // now (their grace periods elapsed during the checks since).
+  await new Promise(r => setTimeout(r, 250));
+  for (const deadId of [SHARE_ID, 'survivorroom12345']) {
+    const reaper = await connect();
+    reaper.send(JSON.stringify({ type: 'join', id: deadId, passwordHash: null }));
+    const reaped = await nextMessage(reaper);
+    assert.equal(reaped.type, 'error');
+    assert.equal(reaped.code, 'share-not-found');
+    reaper.close();
+  }
+  console.log('ok - grace-expired rooms are reaped, room slots freed');
 
   // 13. Room count and total listing bytes are capped.
   const bigListing = { kind: 'files', files: Array.from({ length: 60 }, (_, i) => ({ path: `folder/file-${i}.bin`, size: i })), hasText: false };

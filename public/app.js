@@ -211,7 +211,7 @@ function updateTabWarning() {
   const warn = $('tabWarning');
   if (!liveSender || liveDone) { warn.hidden = true; return; }
   warn.hidden = false;
-  warn.textContent = '⚠ Don\'t close this tab until the receiver has downloaded. Keep it open and in the foreground — the files live only in this tab, and closing or backgrounding it ends the share.';
+  warn.textContent = '⚠ Don\'t close this tab until the receiver has downloaded. If you switch to another app to share the link, come back to this tab — the share stays alive for 10 minutes while you\'re away, and resumes the moment this tab is open again.';
 }
 
 window.addEventListener('beforeunload', e => {
@@ -221,9 +221,32 @@ window.addEventListener('beforeunload', e => {
   }
 });
 
-window.addEventListener('pagehide', () => {
-  try { if (liveSender) liveSender.close(); } catch {}
-});
+// NOTE: no pagehide handler closes the share on purpose. On a phone,
+// switching to another app to share the link hides this page — killing
+// the sender there would end the share at exactly the moment the link
+// goes out. Backgrounding is survivable now: the server keeps the room
+// for a grace period and this tab reconnects when it comes back, so
+// the share must stay alive across hide/show cycles. Closing the tab
+// for real drops the socket on its own.
+
+// Share sheet (phone): opens the system share target picker (WhatsApp
+// included) without leaving this page's flow, so the trip away from
+// the tab is as short as possible. Falls back to copying the link.
+function shareLink(v) {
+  if (!v) {
+    statusEl.textContent = 'Create a share link first.';
+    statusEl.classList.add('err');
+    return;
+  }
+  if (navigator.share) {
+    navigator.share({ title: 'UniShare', text: 'Download from my UniShare link:', url: v })
+      .catch(() => {});
+    return;
+  }
+  copyLink(v);
+}
+
+$('shareBtn').addEventListener('click', () => shareLink($('shareLink').textContent));
 
 $('stopShareBtn').addEventListener('click', () => {
   try { if (liveSender) liveSender.close(); } catch {}
@@ -416,6 +439,7 @@ const commands = [
   { label: 'Focus text note', hint: 'NOTE', run: () => { textInput.scrollIntoView({ behavior: 'smooth', block: 'center' }); textInput.focus(); } },
   { label: 'Set a password', hint: 'LOCK', run: () => { passwordInput.scrollIntoView({ behavior: 'smooth', block: 'center' }); passwordInput.focus(); } },
   { label: 'Create share link', hint: 'ENTER', run: () => doUpload() },
+  { label: 'Share link via…', hint: 'SHARE', run: () => shareLink($('shareLink').textContent) },
   { label: 'Copy share link', hint: 'COPY', run: () => copyLink($('shareLink').textContent) },
   { label: 'Open share link', hint: 'OPEN', run: () => { const url = $('shareLink').href; if (url) window.open(url, '_blank', 'noopener'); } }
 ];
